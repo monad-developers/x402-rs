@@ -78,7 +78,11 @@ pub struct Eip155ChainProvider {
 
 impl Eip155ChainProvider {
     #[allow(unused_variables)] // chain_id is needed for tracing only here
-    pub fn rpc_client(chain_id: ChainId, rpc: &[RpcConfig]) -> RpcClient {
+    pub fn rpc_client(
+        chain_id: ChainId,
+        rpc: &[RpcConfig],
+        poll_interval_ms: Option<u64>,
+    ) -> RpcClient {
         let transports = rpc
             .iter()
             .filter_map(|provider_config| {
@@ -105,7 +109,12 @@ impl Eip155ChainProvider {
                 ),
             )
             .service(transports);
-        RpcClient::new(fallback, false)
+        let client = RpcClient::new(fallback, false);
+        if let Some(ms) = poll_interval_ms {
+            client.with_poll_interval(std::time::Duration::from_millis(ms))
+        } else {
+            client
+        }
     }
 
     /// Round-robin selection of next signer from wallet.
@@ -164,7 +173,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         let signer_cursor = Arc::new(AtomicUsize::new(0));
 
         // 2. Transports
-        let client = Self::rpc_client(config.chain_id(), config.rpc());
+        let client = Self::rpc_client(config.chain_id(), config.rpc(), config.poll_interval_ms());
 
         // 3. Provider
         // Create nonce manager explicitly so we can store a reference for error handling

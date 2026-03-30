@@ -60,6 +60,11 @@ impl Eip155ChainConfig {
         &self.inner.rpc
     }
 
+    /// Returns the poll interval in milliseconds, if configured.
+    pub fn poll_interval_ms(&self) -> Option<u64> {
+        self.inner.poll_interval_ms
+    }
+
     /// Returns the numeric chain reference.
     pub fn chain_reference(&self) -> Eip155ChainReference {
         self.chain_reference
@@ -83,6 +88,11 @@ pub struct Eip155ChainConfigInner {
     /// How long to wait till the transaction receipt is available (optional)
     #[serde(default = "eip155_chain_config::default_receipt_timeout_secs")]
     pub receipt_timeout_secs: u64,
+    /// Poll interval in milliseconds for receipt detection (optional).
+    /// Lower values improve receipt detection latency on fast-finality chains like Monad.
+    /// Default: None (uses alloy default of 7000ms for remote transports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
 }
 
 mod eip155_chain_config {
