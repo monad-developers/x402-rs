@@ -65,6 +65,11 @@ impl Eip155ChainConfig {
         self.inner.poll_interval_ms
     }
 
+    /// Returns whether this chain uses synchronous transaction sending (EIP-7966).
+    pub fn sync_send(&self) -> bool {
+        self.inner.sync_send
+    }
+
     /// Returns the numeric chain reference.
     pub fn chain_reference(&self) -> Eip155ChainReference {
         self.chain_reference
@@ -93,6 +98,14 @@ pub struct Eip155ChainConfigInner {
     /// Default: None (uses alloy default of 7000ms for remote transports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_ms: Option<u64>,
+    /// Whether to use `eth_sendRawTransactionSync` (EIP-7966) for transaction submission.
+    /// When enabled, transactions are sent synchronously and the receipt is returned in a
+    /// single RPC call, eliminating the polling loop entirely.
+    /// Only supported by chains that implement EIP-7966 (e.g., Monad).
+    /// When `true`, `poll_interval_ms` and `receipt_timeout_secs` have no effect on settlement.
+    /// Default: false (uses standard send + poll).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sync_send: bool,
 }
 
 mod eip155_chain_config {

@@ -155,6 +155,8 @@ The Permit2 implementation is designed to support gasless approval extensions:
     "eip1559": true,
     "flashblocks": false,
     "receipt_timeout_secs": 30,
+    "poll_interval_ms": 500,
+    "sync_send": false,
     "signers": [
       "$FACILITATOR_PRIVATE_KEY"
     ],
@@ -167,6 +169,18 @@ The Permit2 implementation is designed to support gasless approval extensions:
   }
 }
 ```
+
+### Configuration Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `eip1559` | `bool` | `true` | Whether the chain supports EIP-1559 gas pricing |
+| `flashblocks` | `bool` | `false` | Whether the chain supports flashblocks |
+| `receipt_timeout_secs` | `u64` | `30` | Timeout for receipt polling |
+| `poll_interval_ms` | `u64?` | `None` | Poll interval override (default: 7000ms). Lower values improve latency on fast-finality chains |
+| `sync_send` | `bool` | `false` | Use `eth_sendRawTransactionSync` (EIP-7966) to get receipts in a single RPC call. Only for chains that support it (e.g., Monad). When `true`, `poll_interval_ms` and `receipt_timeout_secs` have no effect on settlement |
+| `signers` | `string[]` | required | Private keys (hex) or env var references (`$KEY`) |
+| `rpc` | `object[]` | required | RPC endpoints with `http` URL and optional `rate_limit` |
 
 ## Dependencies
 
