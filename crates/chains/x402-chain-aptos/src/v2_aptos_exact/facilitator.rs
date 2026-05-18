@@ -321,7 +321,10 @@ pub async fn verify_transfer(
 
     // 15. Recipient address
     let recipient_address: AccountAddress = bcs::from_bytes(&args[1]).map_err(|e| {
-        PaymentVerificationError::InvalidFormat(format!("Failed to parse recipient address: {}", e))
+        PaymentVerificationError::InvalidFormat(format!(
+            "Failed to parse recipient address: {}",
+            e
+        ))
     })?;
     let expected_recipient = requirements.pay_to.inner();
     if &recipient_address != expected_recipient {

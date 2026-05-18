@@ -112,7 +112,6 @@ impl Serialize for DecimalU256 {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0.to_string())
     }
-}
 
 impl<'de> Deserialize<'de> for DecimalU256 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
