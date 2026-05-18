@@ -2,7 +2,7 @@
 
 This directory contains a comprehensive protocol compliance test harness for the x402-rs project. It tests various combinations of client, server, and facilitator implementations across multiple chains and protocol versions.
 
-> **Monad fork note (`monad-developers/x402-rs`)** — this fork ships an EVM-only facilitator (Monad). Solana (`@x402/svm`) and Aptos paths are not exercised by our deployment and are not on the supported-chains list. `@x402/svm` is pinned to upstream's tested 2.3.0 via `pnpm.overrides` because bumping it cascades to a breaking `Permit2Witness` change in `@x402/evm`. Any flagged vulnerability in `@x402/svm` is in the facilitator-role code path (server-side payment verification on Solana), which this fork does not run. Tracked in beads as `workplace-8d17`.
+> **Monad fork note (`monad-developers/x402-rs`)** — this fork ships an EVM-only facilitator (Monad). Solana (`@x402/svm`) and Aptos paths are not exercised by our deployment. The `@x402/*` SDK family is tracked at `^2.12.x` (current upstream-published versions, vuln-patched); the custom `upto-evm-scheme.ts` was removed in favor of the SDK's native `@x402/evm/upto/{client,server}` classes.
 
 ## Overview
 
