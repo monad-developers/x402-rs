@@ -2,6 +2,8 @@
 
 This directory contains a comprehensive protocol compliance test harness for the x402-rs project. It tests various combinations of client, server, and facilitator implementations across multiple chains and protocol versions.
 
+> **Monad fork note (`monad-developers/x402-rs`)** — this fork ships an EVM-only facilitator (Monad). Solana (`@x402/svm`) and Aptos paths are not exercised by our deployment and are not on the supported-chains list. `@x402/svm` is pinned to upstream's tested 2.3.0 via `pnpm.overrides` because bumping it cascades to a breaking `Permit2Witness` change in `@x402/evm`. Any flagged vulnerability in `@x402/svm` is in the facilitator-role code path (server-side payment verification on Solana), which this fork does not run. Tracked in beads as `workplace-8d17`.
+
 ## Overview
 
 The test harness validates that different implementations (Rust and TypeScript) can interoperate correctly when using the x402 payment protocol. It spins up real services (facilitator, server) and makes actual payment-enabled HTTP requests to verify end-to-end functionality.
