@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `x402-chain-eip155::v2_eip155_upto`: align with canonical x402-foundation contract at `0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002` (pinned by `@x402/evm@2.12.0`). Updates `UPTO_PERMIT2_PROXY_ADDRESS`, replaces ABI from x402-foundation/x402@ad2658a, replaces `UptoPermit2Witness` from `{to, validAfter, extra: bytes}` to canonical `{to, facilitator, validAfter}`, adds `getExtra()` so V2Eip155Upto advertises `extra.facilitatorAddress` (primary signer EOA) in `SupportedPaymentKind`. EIP-712 typehash now `0xd4171c44…2253b75`. Adds compile-time `WITNESS_TYPEHASH` regression test in `chain/permit2.rs`.
+- `x402-chain-eip155::chain/provider.rs`: include `UPTO_PERMIT2_PROXY_ADDRESS` in `REQUIRED_CONTRACT_ADDRESSES` so providers fail-fast at boot if the upto proxy is missing on a configured chain.
+- `x402-chain-eip155::v2_eip155_upto::facilitator`: `build()` now rejects providers with empty signer lists (upto requires at least one signer to bind into the Permit2 witness).
+
 ## [1.4.5] - 2026-03-14
 
 ### Fixed

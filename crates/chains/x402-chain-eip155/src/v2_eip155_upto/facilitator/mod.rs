@@ -30,6 +30,15 @@ where
         provider: P,
         _config: Option<serde_json::Value>,
     ) -> Result<Box<dyn X402SchemeFacilitator>, Box<dyn std::error::Error>> {
+        // v2-eip155-upto signs the facilitator EOA into the Permit2 witness;
+        // a missing signer would produce a non-advertisable scheme that any
+        // client call into supported() would interpret as "extra missing" far
+        // from the source. Fail-fast here.
+        if provider.signer_addresses().is_empty() {
+            return Err(
+                "V2Eip155Upto::build: provider must have at least one signer (witness.facilitator binds to the first signer EOA)".into(),
+            );
+        }
         Ok(Box::new(V2Eip155UptoFacilitator::new(provider)))
     }
 }
@@ -102,12 +111,18 @@ where
         let signer_addresses = self.provider.signer_addresses();
         // Advertise the primary facilitator EOA so clients can bind it into the witness.
         // The on-chain proxy enforces msg.sender == witness.facilitator at settle time.
-        let extra = signer_addresses
+        // build() already asserts the signer list is non-empty; .expect() flags any
+        // signer-address format regression loudly rather than silently dropping extra.
+        let first_signer = signer_addresses
             .first()
-            .and_then(|s| s.parse::<alloy_primitives::Address>().ok())
-            .and_then(|facilitator_address| {
-                serde_json::to_value(types::UptoExtra { facilitator_address }).ok()
-            });
+            .expect("V2Eip155UptoFacilitator constructed without signers — build() should have rejected this");
+        let facilitator_address = first_signer
+            .parse::<alloy_primitives::Address>()
+            .expect("signer address from provider must parse as alloy_primitives::Address");
+        let extra = Some(
+            serde_json::to_value(types::UptoExtra { facilitator_address })
+                .expect("UptoExtra is always serializable"),
+        );
         let kinds = vec![proto::SupportedPaymentKind {
             x402_version: v2::X402Version2.into(),
             scheme: types::UptoScheme.to_string(),

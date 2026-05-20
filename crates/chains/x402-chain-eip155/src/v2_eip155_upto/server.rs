@@ -43,7 +43,10 @@ impl V2Eip155Upto {
         facilitator_address: Address,
     ) -> v2::PriceTag {
         let chain_id: ChainId = asset.token.chain_reference.into();
-        let extra = serde_json::to_value(UptoExtra { facilitator_address }).ok();
+        let extra = Some(
+            serde_json::to_value(UptoExtra { facilitator_address })
+                .expect("UptoExtra is always serializable"),
+        );
         let requirements = v2::PaymentRequirements {
             scheme: UptoScheme.to_string(),
             pay_to: pay_to.into().to_string(),

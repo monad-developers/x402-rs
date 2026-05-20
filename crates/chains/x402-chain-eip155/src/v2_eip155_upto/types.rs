@@ -122,6 +122,10 @@ pub mod facilitator_client_only {
             address spender;
             uint256 nonce;
             uint256 deadline;
+            // Cross-`sol!` struct reference: `x402UptoPermit2Proxy.Witness` is
+            // emitted by the JSON-ABI macro above. Alloy resolves these by name
+            // at code-gen time, so the reference is valid even though the type
+            // is defined in a separate `sol!` invocation.
             x402UptoPermit2Proxy.Witness witness;
         }
     );
