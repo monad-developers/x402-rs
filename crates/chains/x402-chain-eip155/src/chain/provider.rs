@@ -76,6 +76,8 @@ pub struct Eip155ChainProvider {
     chain: Eip155ChainReference,
     eip1559: bool,
     flashblocks: bool,
+    /// Whether to submit transactions via `eth_sendRawTransactionSync` (EIP-7966).
+    sync_send: bool,
     receipt_timeout_secs: u64,
     inner: InnerProvider,
     /// Available signer addresses for round-robin selection.
@@ -88,7 +90,11 @@ pub struct Eip155ChainProvider {
 
 impl Eip155ChainProvider {
     #[allow(unused_variables)] // chain_id is needed for tracing only here
-    pub fn rpc_client(chain_id: ChainId, rpc: &[RpcConfig]) -> RpcClient {
+    pub fn rpc_client(
+        chain_id: ChainId,
+        rpc: &[RpcConfig],
+        poll_interval_ms: Option<u64>,
+    ) -> RpcClient {
         let transports = rpc
             .iter()
             .filter_map(|provider_config| {
@@ -115,7 +121,14 @@ impl Eip155ChainProvider {
                 ),
             )
             .service(transports);
-        RpcClient::new(fallback, false)
+        let client = RpcClient::new(fallback, false);
+        // Override the receipt poll interval on fast-finality chains (e.g. Monad).
+        // Ignored when `sync_send` is enabled (no polling occurs in that path).
+        if let Some(ms) = poll_interval_ms {
+            client.with_poll_interval(std::time::Duration::from_millis(ms))
+        } else {
+            client
+        }
     }
 
     /// Round-robin selection of next signer from wallet.
@@ -174,7 +187,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         let signer_cursor = Arc::new(AtomicUsize::new(0));
 
         // 2. Transports
-        let client = Self::rpc_client(config.chain_id(), config.rpc());
+        let client = Self::rpc_client(config.chain_id(), config.rpc(), config.poll_interval_ms());
 
         // 3. Provider
         // Create nonce manager explicitly so we can store a reference for error handling
@@ -201,10 +214,19 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         #[cfg(feature = "telemetry")]
         tracing::info!(chain=%config.chain_id(), signers=?signer_addresses, "Using EVM provider");
 
+        #[cfg(feature = "telemetry")]
+        if config.sync_send() && config.poll_interval_ms().is_some() {
+            tracing::info!(
+                chain=%config.chain_id(),
+                "sync_send is enabled; poll_interval_ms has no effect on transaction settlement"
+            );
+        }
+
         Ok(Self {
             chain: config.chain_reference(),
             eip1559: config.eip1559(),
             flashblocks: config.flashblocks(),
+            sync_send: config.sync_send(),
             receipt_timeout_secs: config.receipt_timeout_secs(),
             inner,
             signer_addresses,
@@ -296,30 +318,45 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
             txr.set_gas_limit(gas_limit)
         }
 
-        // Send transaction with error handling for nonce reset
-        let pending_tx = match self.inner.send_transaction(txr).await {
-            Ok(pending) => pending,
-            Err(e) => {
-                // Transaction submission failed - reset nonce to force requery
-                self.nonce_manager.reset_nonce(from_address).await;
-                return Err(MetaTransactionSendError::Transport(e));
+        if self.sync_send {
+            // EIP-7966: `eth_sendRawTransactionSync` returns the receipt in a single
+            // RPC call, eliminating the send + poll round-trip. Only enable on chains
+            // that implement EIP-7966 (e.g. Monad).
+            match self.inner.send_transaction_sync(txr).await {
+                Ok(receipt) => Ok(receipt),
+                Err(e) => {
+                    // Submission failed - reset nonce to force requery
+                    self.nonce_manager.reset_nonce(from_address).await;
+                    Err(MetaTransactionSendError::Transport(e))
+                }
             }
-        };
+        } else {
+            // Standard path: send, then poll for the receipt with a timeout.
+            // Send transaction with error handling for nonce reset
+            let pending_tx = match self.inner.send_transaction(txr).await {
+                Ok(pending) => pending,
+                Err(e) => {
+                    // Transaction submission failed - reset nonce to force requery
+                    self.nonce_manager.reset_nonce(from_address).await;
+                    return Err(MetaTransactionSendError::Transport(e));
+                }
+            };
 
-        // Get receipt with timeout and error handling for nonce reset
-        // Default timeout of 30 seconds is reasonable for most EVM chains
-        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
+            // Get receipt with timeout and error handling for nonce reset
+            // Default timeout of 30 seconds is reasonable for most EVM chains
+            let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
 
-        let watcher = pending_tx
-            .with_required_confirmations(tx.confirmations)
-            .with_timeout(Some(timeout));
+            let watcher = pending_tx
+                .with_required_confirmations(tx.confirmations)
+                .with_timeout(Some(timeout));
 
-        match watcher.get_receipt().await {
-            Ok(receipt) => Ok(receipt),
-            Err(e) => {
-                // Receipt fetch failed (timeout or other error) - reset nonce to force requery
-                self.nonce_manager.reset_nonce(from_address).await;
-                Err(MetaTransactionSendError::PendingTransaction(e))
+            match watcher.get_receipt().await {
+                Ok(receipt) => Ok(receipt),
+                Err(e) => {
+                    // Receipt fetch failed (timeout or other error) - reset nonce to force requery
+                    self.nonce_manager.reset_nonce(from_address).await;
+                    Err(MetaTransactionSendError::PendingTransaction(e))
+                }
             }
         }
     }
