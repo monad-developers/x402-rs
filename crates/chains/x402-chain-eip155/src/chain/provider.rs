@@ -25,9 +25,7 @@ use tracing::Instrument;
 
 use crate::chain::config::{Eip155ChainConfig, RpcConfig};
 use crate::chain::pending_nonce_manager::PendingNonceManager;
-use crate::chain::permit2::{
-    EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS, UPTO_PERMIT2_PROXY_ADDRESS,
-};
+use crate::chain::permit2::{EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS};
 use crate::chain::types::Eip155ChainReference;
 use crate::v1_eip155_exact::VALIDATOR_ADDRESS;
 
@@ -37,12 +35,11 @@ pub type InnerFiller = JoinFill<
     JoinFill<BlobGasFiller, JoinFill<NonceFiller<PendingNonceManager>, ChainIdFiller>>,
 >;
 
-const REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
+static REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
     vec![
         VALIDATOR_ADDRESS,
         PERMIT2_ADDRESS,
         EXACT_PERMIT2_PROXY_ADDRESS,
-        UPTO_PERMIT2_PROXY_ADDRESS,
     ]
 });
 
@@ -79,7 +76,6 @@ pub struct Eip155ChainProvider {
     chain: Eip155ChainReference,
     eip1559: bool,
     flashblocks: bool,
-    sync_send: bool,
     receipt_timeout_secs: u64,
     inner: InnerProvider,
     /// Available signer addresses for round-robin selection.
@@ -92,11 +88,7 @@ pub struct Eip155ChainProvider {
 
 impl Eip155ChainProvider {
     #[allow(unused_variables)] // chain_id is needed for tracing only here
-    pub fn rpc_client(
-        chain_id: ChainId,
-        rpc: &[RpcConfig],
-        poll_interval_ms: Option<u64>,
-    ) -> RpcClient {
+    pub fn rpc_client(chain_id: ChainId, rpc: &[RpcConfig]) -> RpcClient {
         let transports = rpc
             .iter()
             .filter_map(|provider_config| {
@@ -123,12 +115,7 @@ impl Eip155ChainProvider {
                 ),
             )
             .service(transports);
-        let client = RpcClient::new(fallback, false);
-        if let Some(ms) = poll_interval_ms {
-            client.with_poll_interval(std::time::Duration::from_millis(ms))
-        } else {
-            client
-        }
+        RpcClient::new(fallback, false)
     }
 
     /// Round-robin selection of next signer from wallet.
@@ -187,7 +174,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         let signer_cursor = Arc::new(AtomicUsize::new(0));
 
         // 2. Transports
-        let client = Self::rpc_client(config.chain_id(), config.rpc(), config.poll_interval_ms());
+        let client = Self::rpc_client(config.chain_id(), config.rpc());
 
         // 3. Provider
         // Create nonce manager explicitly so we can store a reference for error handling
@@ -195,7 +182,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         // Build the filler stack: Gas -> BlobGas -> Nonce -> ChainId
         // This mirrors the InnerFiller type but with our custom nonce manager
         let filler = JoinFill::new(
-            GasFiller,
+            GasFiller::default(),
             JoinFill::new(
                 BlobGasFiller::default(),
                 JoinFill::new(
@@ -214,19 +201,10 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         #[cfg(feature = "telemetry")]
         tracing::info!(chain=%config.chain_id(), signers=?signer_addresses, "Using EVM provider");
 
-        #[cfg(feature = "telemetry")]
-        if config.sync_send() && config.poll_interval_ms().is_some() {
-            tracing::info!(
-                chain=%config.chain_id(),
-                "sync_send is enabled; poll_interval_ms has no effect on transaction settlement"
-            );
-        }
-
         Ok(Self {
             chain: config.chain_reference(),
             eip1559: config.eip1559(),
             flashblocks: config.flashblocks(),
-            sync_send: config.sync_send(),
             receipt_timeout_secs: config.receipt_timeout_secs(),
             inner,
             signer_addresses,
@@ -289,7 +267,7 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         &self,
         tx: MetaTransaction,
     ) -> Result<TransactionReceipt, Self::Error> {
-        let from_address = self.next_signer_address();
+        let from_address = tx.from.unwrap_or_else(|| self.next_signer_address());
         let mut txr = TransactionRequest::default()
             .with_to(tx.to)
             .with_from(from_address)
@@ -318,36 +296,30 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
             txr.set_gas_limit(gas_limit)
         }
 
-        if self.sync_send {
-            // EIP-7966: single RPC call returns receipt directly, no polling
-            match self.inner.send_transaction_sync(txr).await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::Transport(e))
-                }
+        // Send transaction with error handling for nonce reset
+        let pending_tx = match self.inner.send_transaction(txr).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                // Transaction submission failed - reset nonce to force requery
+                self.nonce_manager.reset_nonce(from_address).await;
+                return Err(MetaTransactionSendError::Transport(e));
             }
-        } else {
-            // Standard: send + poll for receipt
-            let pending_tx = match self.inner.send_transaction(txr).await {
-                Ok(pending) => pending,
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    return Err(MetaTransactionSendError::Transport(e));
-                }
-            };
+        };
 
-            let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
-            let watcher = pending_tx
-                .with_required_confirmations(tx.confirmations)
-                .with_timeout(Some(timeout));
+        // Get receipt with timeout and error handling for nonce reset
+        // Default timeout of 30 seconds is reasonable for most EVM chains
+        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
 
-            match watcher.get_receipt().await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::PendingTransaction(e))
-                }
+        let watcher = pending_tx
+            .with_required_confirmations(tx.confirmations)
+            .with_timeout(Some(timeout));
+
+        match watcher.get_receipt().await {
+            Ok(receipt) => Ok(receipt),
+            Err(e) => {
+                // Receipt fetch failed (timeout or other error) - reset nonce to force requery
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::PendingTransaction(e))
             }
         }
     }
@@ -377,6 +349,33 @@ impl ChainProviderOps for Eip155ChainProvider {
     }
 }
 
+/// Provides access to the EIP-155 signer addresses held by a facilitator provider.
+///
+/// Implementations return the set of addresses whose private keys the provider
+/// controls and can use to submit on-chain transactions. The facilitator exposes
+/// one of these addresses to clients via the `supported()` endpoint so they can
+/// embed it in the Permit2 witness, ensuring only this facilitator can settle the
+/// authorized payment.
+pub trait Eip155SignerAddresses {
+    /// Returns an iterator over the signer addresses available on this provider.
+    fn signer_addresses(&self) -> Vec<Address>;
+}
+
+impl<T> Eip155SignerAddresses for Arc<T>
+where
+    T: Eip155SignerAddresses,
+{
+    fn signer_addresses(&self) -> Vec<Address> {
+        (**self).signer_addresses()
+    }
+}
+
+impl Eip155SignerAddresses for Eip155ChainProvider {
+    fn signer_addresses(&self) -> Vec<Address> {
+        (*self.signer_addresses).clone()
+    }
+}
+
 /// Meta-transaction parameters: target address, calldata, and required confirmations.
 pub struct MetaTransaction {
     /// Target contract address.
@@ -385,6 +384,8 @@ pub struct MetaTransaction {
     pub calldata: Bytes,
     /// Number of block confirmations to wait for.
     pub confirmations: u64,
+    /// Optional sender address.
+    pub from: Option<Address>,
 }
 
 impl MetaTransaction {
@@ -393,7 +394,13 @@ impl MetaTransaction {
             to,
             calldata,
             confirmations: 1,
+            from: None,
         }
+    }
+
+    pub fn with_from(mut self, from: Address) -> Self {
+        self.from = Some(from);
+        self
     }
 }
 

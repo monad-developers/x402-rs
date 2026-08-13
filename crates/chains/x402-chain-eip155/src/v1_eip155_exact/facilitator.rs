@@ -27,6 +27,8 @@ use x402_types::scheme::{
     X402SchemeFacilitator, X402SchemeFacilitatorBuilder, X402SchemeFacilitatorError,
 };
 use x402_types::timestamp::UnixTimestamp;
+#[cfg(feature = "telemetry")]
+use x402_types::util::telemetry::record_payment_context;
 
 #[cfg(feature = "telemetry")]
 use tracing::{Instrument, instrument};
@@ -35,8 +37,8 @@ use tracing_core::Level;
 
 use crate::V1Eip155Exact;
 use crate::chain::{
-    EOASignatureExt, Eip155ChainReference, Eip155MetaTransactionProvider, MetaTransaction,
-    MetaTransactionSendError,
+    EOASignature, EOASignatureExt, Eip155ChainReference, Eip155MetaTransactionProvider,
+    MetaTransaction, MetaTransactionSendError,
 };
 use crate::v1_eip155_exact::{
     ExactScheme, PaymentRequirementsExtra, TransferWithAuthorization, types,
@@ -45,7 +47,6 @@ use crate::v1_eip155_exact::{
 /// Signature verifier for EIP-6492, EIP-1271, EOA, universally deployed on the supported EVM chains
 /// If absent on a target chain, verification will fail; you should deploy the validator there.
 // Note: Expect deployed on every chain
-// TODO Configurable validator address per chain
 pub const VALIDATOR_ADDRESS: Address = address!("0xdAcD51A54883eb67D95FAEb2BBfdC4a9a6BD2a3B");
 
 impl<P> X402SchemeFacilitatorBuilder<P> for V1Eip155Exact
@@ -89,13 +90,27 @@ where
     P::Inner: Provider,
     Eip155ExactError: From<P::Error>,
 {
+    #[cfg_attr(feature = "telemetry", instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn verify(
         &self,
         request: &proto::VerifyRequest,
     ) -> Result<proto::VerifyResponse, X402SchemeFacilitatorError> {
-        let request = types::VerifyRequest::from_proto(request.clone())?;
+        let request = types::VerifyRequest::try_from(request)?;
         let payload = &request.payment_payload;
         let requirements = &request.payment_requirements;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_payment_context(
+            &chain_id,
+            payload.payload.authorization.from,
+            requirements.pay_to,
+        );
         let (contract, payment, eip712_domain) = assert_valid_payment(
             self.provider.inner(),
             self.provider.chain(),
@@ -110,13 +125,27 @@ where
         Ok(v1::VerifyResponse::valid(payer.to_string()).into())
     }
 
+    #[cfg_attr(feature = "telemetry", instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn settle(
         &self,
         request: &proto::SettleRequest,
     ) -> Result<proto::SettleResponse, X402SchemeFacilitatorError> {
-        let request = types::SettleRequest::from_proto(request.clone())?;
+        let request = types::SettleRequest::try_from(request)?;
         let payload = &request.payment_payload;
         let requirements = &request.payment_requirements;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_payment_context(
+            &chain_id,
+            payload.payload.authorization.from,
+            requirements.pay_to,
+        );
         let (contract, payment, eip712_domain) = assert_valid_payment(
             self.provider.inner(),
             self.provider.chain(),
@@ -463,7 +492,7 @@ pub enum StructuredSignature {
     },
     /// Normalized EOA signature.
     #[allow(clippy::upper_case_acronyms)]
-    EOA(Signature),
+    EOA(EOASignature),
     /// A plain EIP-1271 or EOA signature (no 6492 wrappers).
     EIP1271(Bytes),
 }
@@ -528,7 +557,7 @@ impl StructuredSignature {
                         .map(|r| r == expected_signer)
                         .unwrap_or(false);
                     if is_expected_signer {
-                        StructuredSignature::EOA(s)
+                        StructuredSignature::EOA(EOASignature::new(s))
                     } else {
                         StructuredSignature::EIP1271(bytes)
                     }
@@ -536,6 +565,16 @@ impl StructuredSignature {
             }
         };
         Ok(signature)
+    }
+}
+
+impl From<StructuredSignature> for Bytes {
+    fn from(value: StructuredSignature) -> Self {
+        match value {
+            StructuredSignature::EIP6492 { inner, .. } => inner,
+            StructuredSignature::EOA(sig) => Bytes::from(sig.as_ref().as_bytes()),
+            StructuredSignature::EIP1271(sig) => sig,
+        }
     }
 }
 
@@ -794,7 +833,8 @@ pub async fn verify_payment<P: Provider>(
         }
         StructuredSignature::EOA(signature) => {
             // It is EOA signature, which we can pass to the transfer simulation of (r,s,v)-based transferWithAuthorization function
-            let transfer_call = TransferWithAuthorization1Call::new(contract, payment, signature);
+            let transfer_call =
+                TransferWithAuthorization1Call::new(contract, payment, signature.into());
             let transfer_call = transfer_call.0;
             let transfer_call_fut = transfer_call.tx.call().into_future();
             #[cfg(feature = "telemetry")]
@@ -843,14 +883,11 @@ where
             let transfer_call = transfer_call.0;
             if is_contract_deployed {
                 // transferWithAuthorization with inner signature
-                let tx_fut = Eip155MetaTransactionProvider::send_transaction(
-                    provider,
-                    MetaTransaction {
-                        to: transfer_call.tx.target(),
-                        calldata: transfer_call.tx.calldata().clone(),
-                        confirmations: 1,
-                    },
+                let meta_tx = MetaTransaction::new(
+                    transfer_call.tx.target(),
+                    transfer_call.tx.calldata().clone(),
                 );
+                let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, meta_tx);
                 #[cfg(feature = "telemetry")]
                 let receipt = tx_fut
                     .instrument(tracing::info_span!("call_transferWithAuthorization_0",
@@ -884,14 +921,9 @@ where
                 let aggregate_call = IMulticall3::aggregate3Call {
                     calls: vec![deployment_call, transfer_with_authorization_call],
                 };
-                let tx_fut = Eip155MetaTransactionProvider::send_transaction(
-                    provider,
-                    MetaTransaction {
-                        to: MULTICALL3_ADDRESS,
-                        calldata: aggregate_call.abi_encode().into(),
-                        confirmations: 1,
-                    },
-                );
+                let meta_tx =
+                    MetaTransaction::new(MULTICALL3_ADDRESS, aggregate_call.abi_encode().into());
+                let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, meta_tx);
                 #[cfg(feature = "telemetry")]
                 let receipt = tx_fut
                     .instrument(tracing::info_span!("call_transferWithAuthorization_0",
@@ -917,14 +949,11 @@ where
                 TransferWithAuthorization0Call::new(contract, payment, eip1271_signature);
             let transfer_call = transfer_call.0;
             // transferWithAuthorization with eip1271 signature
-            let tx_fut = Eip155MetaTransactionProvider::send_transaction(
-                provider,
-                MetaTransaction {
-                    to: transfer_call.tx.target(),
-                    calldata: transfer_call.tx.calldata().clone(),
-                    confirmations: 1,
-                },
+            let meta_tx = MetaTransaction::new(
+                transfer_call.tx.target(),
+                transfer_call.tx.calldata().clone(),
             );
+            let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, meta_tx);
             #[cfg(feature = "telemetry")]
             let receipt = tx_fut
                 .instrument(tracing::info_span!("call_transferWithAuthorization_0",
@@ -945,17 +974,15 @@ where
             receipt
         }
         StructuredSignature::EOA(signature) => {
-            let transfer_call = TransferWithAuthorization1Call::new(contract, payment, signature);
+            let transfer_call =
+                TransferWithAuthorization1Call::new(contract, payment, signature.into());
             let transfer_call = transfer_call.0;
             // transferWithAuthorization with EOA signature
-            let tx_fut = Eip155MetaTransactionProvider::send_transaction(
-                provider,
-                MetaTransaction {
-                    to: transfer_call.tx.target(),
-                    calldata: transfer_call.tx.calldata().clone(),
-                    confirmations: 1,
-                },
+            let meta_tx = MetaTransaction::new(
+                transfer_call.tx.target(),
+                transfer_call.tx.calldata().clone(),
             );
+            let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, meta_tx);
             #[cfg(feature = "telemetry")]
             let receipt = tx_fut
                 .instrument(tracing::info_span!("call_transferWithAuthorization_1",
@@ -979,7 +1006,14 @@ where
     tx_hash_from_receipt(&receipt)
 }
 
-// FIXME Docs
+/// Extracts the transaction hash from a confirmed receipt, or returns an error if the
+/// transaction reverted.
+///
+/// Alloy's [`TransactionReceipt`] always contains a hash, but a receipt with
+/// `status = false` means the EVM execution reverted (e.g. the token transfer was
+/// rejected). This helper centralises that check so callers can treat a reverted
+/// receipt as an [`Eip155ExactError::TransactionReverted`] rather than silently
+/// returning the hash of a failed transaction.
 pub fn tx_hash_from_receipt(receipt: &TransactionReceipt) -> Result<TxHash, Eip155ExactError> {
     let success = receipt.status();
     if success {

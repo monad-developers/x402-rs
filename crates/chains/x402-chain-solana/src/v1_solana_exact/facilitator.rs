@@ -14,6 +14,8 @@ use x402_types::scheme::{
     X402SchemeFacilitator, X402SchemeFacilitatorBuilder, X402SchemeFacilitatorError,
 };
 use x402_types::util::Base64Bytes;
+#[cfg(feature = "telemetry")]
+use x402_types::util::telemetry::{record_chain_and_pay_to, record_payer};
 
 #[cfg(feature = "telemetry")]
 use tracing_core::Level;
@@ -37,7 +39,7 @@ where
         config: Option<serde_json::Value>,
     ) -> Result<Box<dyn X402SchemeFacilitator>, Box<dyn std::error::Error>> {
         let config = config
-            .map(serde_json::from_value::<V1SolanaExactFacilitatorConfig>)
+            .map(V1SolanaExactFacilitatorConfig::deserialize)
             .transpose()?
             .unwrap_or_default();
 
@@ -61,22 +63,46 @@ impl<P> X402SchemeFacilitator for V1SolanaExactFacilitator<P>
 where
     P: SolanaChainProviderLike + ChainProviderOps + Send + Sync,
 {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn verify(
         &self,
         request: &proto::VerifyRequest,
     ) -> Result<proto::VerifyResponse, X402SchemeFacilitatorError> {
-        let request = types::VerifyRequest::from_proto(request.clone())?;
+        let request = types::VerifyRequest::try_from(request)?;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_chain_and_pay_to(&chain_id, &request.payment_requirements.pay_to);
         let verification = verify_transfer(&self.provider, &request, &self.config).await?;
+        #[cfg(feature = "telemetry")]
+        record_payer(&verification.payer);
         Ok(v1::VerifyResponse::valid(verification.payer.to_string()).into())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn settle(
         &self,
         request: &proto::SettleRequest,
     ) -> Result<proto::SettleResponse, X402SchemeFacilitatorError> {
-        let request = types::SettleRequest::from_proto(request.clone())?;
+        let request = types::SettleRequest::try_from(request)?;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_chain_and_pay_to(&chain_id, &request.payment_requirements.pay_to);
         let verification = verify_transfer(&self.provider, &request, &self.config).await?;
         let payer = verification.payer.to_string();
+        #[cfg(feature = "telemetry")]
+        record_payer(&payer);
         let tx_sig = settle_transaction(&self.provider, verification).await?;
         Ok(v1::SettleResponse::Success {
             payer,
@@ -248,6 +274,12 @@ fn get_program_id(transaction: &VersionedTransaction, index: usize) -> Option<Pu
     Some(*instruction.program_id(account_keys))
 }
 
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+    otel.kind = "internal",
+    chain_id = tracing::field::Empty,
+    payer = tracing::field::Empty,
+    pay_to = tracing::field::Empty
+)))]
 pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
     provider: &P,
     request: &types::VerifyRequest,
@@ -258,6 +290,8 @@ pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
 
     // Assert valid payment START
     let chain_id = provider.chain_id();
+    #[cfg(feature = "telemetry")]
+    record_chain_and_pay_to(&chain_id, &requirements.pay_to);
     let payload_chain_id = ChainId::from_network_name(&payload.network)
         .ok_or(PaymentVerificationError::UnsupportedChain)?;
     if payload_chain_id != chain_id {
@@ -281,9 +315,16 @@ pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
         config,
     )
     .await?;
+    #[cfg(feature = "telemetry")]
+    record_payer(&result.payer);
     Ok(result)
 }
 
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+    otel.kind = "internal",
+    payer = tracing::field::Empty,
+    pay_to = %transfer_requirement.pay_to
+)))]
 pub async fn verify_transaction<P: SolanaChainProviderLike>(
     provider: &P,
     transaction_b64_string: String,
@@ -311,6 +352,8 @@ pub async fn verify_transaction<P: SolanaChainProviderLike>(
     // Transfer instruction is ALWAYS at index 2 (CreateATA no longer supported)
     let transfer_instruction =
         verify_transfer_instruction(provider, &transaction, 2, transfer_requirement).await?;
+    #[cfg(feature = "telemetry")]
+    record_payer(Address::new(transfer_instruction.authority));
 
     // Fee payer safety check (configurable but defaults to enabled)
     if config.require_fee_payer_not_in_instructions {

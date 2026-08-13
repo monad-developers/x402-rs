@@ -20,16 +20,17 @@
 //! - [`ResourceInfo`] - Metadata about the paid resource
 //! - [`PriceTag`] - Builder for creating payment requirements
 
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use crate::chain::ChainId;
 use crate::proto;
 use crate::proto::v1;
 use crate::proto::{OriginalJson, SupportedResponse};
+use crate::scheme::ExtensionKey;
 
 /// Version marker for x402 protocol version 2.
 ///
@@ -142,26 +143,12 @@ where
 impl<TPayload, TRequirements> TryFrom<&proto::VerifyRequest>
     for VerifyRequest<TPayload, TRequirements>
 where
-    TPayload: DeserializeOwned,
-    TRequirements: DeserializeOwned,
+    Self: DeserializeOwned,
 {
     type Error = proto::PaymentVerificationError;
 
     fn try_from(value: &proto::VerifyRequest) -> Result<Self, Self::Error> {
-        let deserialized = serde_json::from_str(value.as_str())?;
-        Ok(deserialized)
-    }
-}
-
-impl<TPayload, TRequirements> VerifyRequest<TPayload, TRequirements>
-where
-    Self: DeserializeOwned,
-{
-    pub fn from_proto(
-        // FIXME REMOVE THIS
-        request: proto::VerifyRequest,
-    ) -> Result<Self, proto::PaymentVerificationError> {
-        let value = serde_json::from_str(request.as_str())?;
+        let value = serde_json::from_str(value.as_str())?;
         Ok(value)
     }
 }
@@ -188,8 +175,106 @@ pub struct PaymentPayload<TPaymentRequirements, TPayload> {
     /// Protocol version (always 2).
     pub x402_version: X402Version2,
     /// Optional extension data provided by the client.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extensions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "ExtensionsJson::is_empty")]
+    pub extensions: ExtensionsJson,
+}
+
+/// A JSON-object map of protocol extension data attached to a payment message.
+///
+/// `ExtensionsJson` is the wire representation of optional extension fields in
+/// [`PaymentPayload`] and [`PaymentRequired`]. Each extension is keyed by the
+/// string constant exposed by [`ExtensionKey::EXTENSION_KEY`] and stored as a
+/// JSON value, so heterogeneous extension types can coexist in the same map.
+///
+/// # Serialization
+///
+/// Serializes to and from a JSON object (e.g. `{ "eip2612GasSponsoring": { … } }`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtensionsJson(serde_json::value::Map<String, serde_json::Value>);
+
+impl ExtensionsJson {
+    /// Creates an empty `ExtensionsJson` map.
+    ///
+    /// Equivalent to [`ExtensionsJson::default()`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if the map contains no extension entries.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Inserts or replaces an extension entry, keyed by `T::EXTENSION_KEY`.
+    ///
+    /// `value` is serialized to a [`serde_json::Value`] before insertion.
+    /// If a value was previously stored under the same key, it is returned
+    /// as `Some(old_value)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if `value` cannot be serialized to JSON.
+    pub fn insert<T>(&mut self, value: T) -> serde_json::Result<Option<serde_json::Value>>
+    where
+        T: ExtensionKey + Serialize,
+    {
+        let key = T::EXTENSION_KEY.to_string();
+        let value = serde_json::to_value(value)?;
+        Ok(self.0.insert(key, value))
+    }
+
+    /// Retrieves and deserializes an extension value by its type.
+    ///
+    /// The lookup key is taken from `T::EXTENSION_KEY` (see [`ExtensionKey`]).
+    /// Returns `None` if the key is absent or if deserialization fails.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `T` – Must implement both [`ExtensionKey`] (to provide the key) and
+    ///   [`serde::de::DeserializeOwned`] (to decode the stored JSON value).
+    pub fn get<T>(&self) -> Option<T>
+    where
+        T: ExtensionKey + DeserializeOwned,
+    {
+        self.0
+            .get(T::EXTENSION_KEY)
+            .and_then(|v| T::deserialize(v).ok())
+    }
+}
+
+impl FromIterator<(String, serde_json::Value)> for ExtensionsJson {
+    /// Collects an iterator of `(key, value)` pairs into an [`ExtensionsJson`].
+    ///
+    /// Values must already be [`serde_json::Value`]s. To build from
+    /// serializable types, serialize each value with [`serde_json::to_value`]
+    /// before collecting, handling any errors at the call site.
+    fn from_iter<I: IntoIterator<Item = (String, serde_json::Value)>>(iter: I) -> Self {
+        ExtensionsJson(iter.into_iter().collect())
+    }
+}
+
+impl From<ExtensionsJson> for serde_json::Value {
+    fn from(value: ExtensionsJson) -> Self {
+        serde_json::Value::Object(value.0)
+    }
+}
+
+impl AsRef<serde_json::Map<String, serde_json::Value>> for ExtensionsJson {
+    fn as_ref(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+}
+
+impl TryFrom<serde_json::Value> for ExtensionsJson {
+    type Error = serde_json::Error;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        if let serde_json::Value::Object(map) = value {
+            Ok(ExtensionsJson(map))
+        } else {
+            Err(serde_json::Error::custom("expected object"))
+        }
+    }
 }
 
 /// Payment requirements set by the seller (V2 format).
@@ -260,6 +345,9 @@ pub struct PaymentRequired<TAccepts = PaymentRequirements> {
     /// List of acceptable payment methods.
     #[serde(default = "Vec::default")]
     pub accepts: Vec<TAccepts>,
+    /// Optional protocol extension declarations provided by the server.
+    #[serde(default, skip_serializing_if = "ExtensionsJson::is_empty")]
+    pub extensions: ExtensionsJson,
 }
 
 /// Builder for creating V2 payment requirements.

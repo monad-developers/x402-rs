@@ -17,8 +17,8 @@
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::{SolStruct, eip712_domain};
 use async_trait::async_trait;
-use rand::{Rng, rng};
-use x402_types::proto::v2::ResourceInfo;
+use rand::{RngExt, rng};
+use x402_types::proto::v2::{ExtensionsJson, ResourceInfo};
 use x402_types::proto::{OriginalJson, PaymentRequired, v2};
 use x402_types::scheme::X402SchemeId;
 use x402_types::scheme::client::{
@@ -198,6 +198,7 @@ where
                     pay_to: requirements.pay_to.to_string(),
                     signer: Box::new(PayloadSigner {
                         resource_info: payment_required.resource.clone(),
+                        extensions: payment_required.extensions.clone(),
                         signer: self.signer.clone(),
                         chain_reference,
                         requirements,
@@ -214,6 +215,7 @@ where
 struct PayloadSigner<S> {
     signer: S,
     resource_info: Option<ResourceInfo>,
+    extensions: ExtensionsJson,
     chain_reference: Eip155ChainReference,
     requirements: types::PaymentRequirements,
     requirements_json: OriginalJson,
@@ -248,10 +250,10 @@ where
                     accepted: self.requirements_json.clone(),
                     resource: self.resource_info.clone(),
                     payload: ExactEvmPayload::Eip3009(evm_payload),
-                    extensions: None,
+                    extensions: self.extensions.clone(),
                 }
             }
-            AssetTransferMethod::Permit2 => {
+            AssetTransferMethod::Permit2 { .. } => {
                 let params = Permit2SigningParams {
                     chain_id: self.chain_reference.inner(),
                     asset_address: self.requirements.asset.0,
@@ -266,7 +268,7 @@ where
                     accepted: self.requirements_json.clone(),
                     resource: self.resource_info.clone(),
                     payload: ExactEvmPayload::Permit2(permit2_payload),
-                    extensions: None,
+                    extensions: self.extensions.clone(),
                 }
             }
         };

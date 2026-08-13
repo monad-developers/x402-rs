@@ -46,10 +46,7 @@ pub async fn verify_permit2_payment<P: Eip155MetaTransactionProvider + ChainProv
     if let Some(eip2612_gas_sponsoring_payload) = &eip2612_gas_sponsoring_payload {
         // Reject EIP-2612 gas sponsoring if not enabled in config
         if !eip2612_gas_sponsoring {
-            return Err(PaymentVerificationError::InvalidSignature(
-                "EIP-2612 gas sponsoring is not enabled by this facilitator".to_string(),
-            )
-            .into());
+            return Err(PaymentVerificationError::eip2612_gas_sponsoring_not_enabled().into());
         }
         eip2612::assert_eip2612_offchain_valid(eip2612_gas_sponsoring_payload, payment_payload)?;
         eip2612::assert_onchain_exact_permit2_with_eip2612(
@@ -87,10 +84,7 @@ where
     let tx_hash = if let Some(eip2612_gas_sponsoring_payload) = &eip2612_gas_sponsoring_payload {
         // Reject EIP-2612 gas sponsoring if not enabled in config
         if !eip2612_gas_sponsoring {
-            return Err(PaymentVerificationError::InvalidSignature(
-                "EIP-2612 gas sponsoring is not enabled by this facilitator".to_string(),
-            )
-            .into());
+            return Err(PaymentVerificationError::eip2612_gas_sponsoring_not_enabled().into());
         }
         eip2612::assert_eip2612_offchain_valid(eip2612_gas_sponsoring_payload, payment_payload)?;
         eip2612::settle_exact_permit2_with_eip2612(
@@ -285,14 +279,9 @@ where
                 let aggregate_call = IMulticall3::aggregate3Call {
                     calls: vec![deployment_call, transfer_with_authorization_call],
                 };
-                let tx_fut = Eip155MetaTransactionProvider::send_transaction(
-                    provider,
-                    MetaTransaction {
-                        to: MULTICALL3_ADDRESS,
-                        calldata: aggregate_call.abi_encode().into(),
-                        confirmations: 1,
-                    },
-                );
+                let meta_tx =
+                    MetaTransaction::new(MULTICALL3_ADDRESS, aggregate_call.abi_encode().into());
+                let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, meta_tx);
                 #[cfg(feature = "telemetry")]
                 let receipt = tx_fut
                     .instrument(tracing::info_span!(
@@ -305,7 +294,7 @@ where
             }
         }
         StructuredSignature::EOA(signature) => {
-            let settle_call = build_call(signature.as_bytes().into());
+            let settle_call = build_call(signature.as_ref().as_bytes().into());
             let tx_fut = Eip155MetaTransactionProvider::send_transaction(provider, settle_call);
             #[cfg(feature = "telemetry")]
             let receipt = tx_fut
@@ -459,7 +448,7 @@ pub async fn assert_onchain_exact_permit2<P: Provider>(
                 permit_transfer_from,
                 payer,
                 witness,
-                signature.as_bytes().into(),
+                signature.as_ref().as_bytes().into(),
             );
             let settle_call_fut = settle_call.call().into_future();
             #[cfg(feature = "telemetry")]

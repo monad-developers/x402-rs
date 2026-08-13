@@ -134,7 +134,7 @@ pub mod asset_transfer_method {
                 AssetTransferMethod::deserialize(deserializer)?;
             match asset_transfer_method {
                 AssetTransferMethod::Eip3009 { name, version } => Ok(Eip3009 { name, version }),
-                AssetTransferMethod::Permit2 => Err(serde::de::Error::custom(
+                AssetTransferMethod::Permit2 { .. } => Err(serde::de::Error::custom(
                     "expected EIP-3009 asset transfer method, got Permit2".to_string(),
                 )),
             }
@@ -157,7 +157,11 @@ pub mod asset_transfer_method {
 
 #[cfg(any(feature = "facilitator", feature = "client"))]
 pub mod facilitator_client_only {
+    use alloy_primitives::U256;
     use alloy_sol_types::sol;
+
+    use crate::chain::EOASignatureExt;
+    use crate::eip2612_gas_sponsoring::Eip2612GasSponsoringInfo;
 
     sol!(
         #[allow(missing_docs)]
@@ -167,6 +171,18 @@ pub mod facilitator_client_only {
         X402ExactPermit2Proxy,
         "abi/X402ExactPermit2Proxy.json"
     );
+
+    impl From<&Eip2612GasSponsoringInfo> for x402ExactPermit2Proxy::EIP2612Permit {
+        fn from(value: &Eip2612GasSponsoringInfo) -> Self {
+            Self {
+                value: value.amount,
+                deadline: U256::from(value.deadline.as_secs()),
+                r: value.signature.r_bytes(),
+                s: value.signature.s_bytes(),
+                v: value.signature.v_legacy(),
+            }
+        }
+    }
 
     sol!(
         /// Signature struct to do settle through [`X402ExactPermit2Proxy`]

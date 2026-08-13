@@ -15,11 +15,14 @@ use x402_types::chain::ChainProviderOps;
 use x402_types::proto;
 use x402_types::proto::v2;
 use x402_types::scheme::{
-    X402SchemeFacilitator, X402SchemeFacilitatorBuilder, X402SchemeFacilitatorError,
+    ExtensionKey, X402SchemeFacilitator, X402SchemeFacilitatorBuilder, X402SchemeFacilitatorError,
 };
+#[cfg(feature = "telemetry")]
+use x402_types::util::telemetry::record_payment_context;
 
 use crate::V2Eip155Exact;
 use crate::chain::Eip155MetaTransactionProvider;
+use crate::eip2612_gas_sponsoring::Eip2612GasSponsoring;
 use crate::v1_eip155_exact::ExactScheme;
 use crate::v1_eip155_exact::facilitator::Eip155ExactError;
 use crate::v2_eip155_exact::types;
@@ -35,7 +38,7 @@ where
         config: Option<serde_json::Value>,
     ) -> Result<Box<dyn X402SchemeFacilitator>, Box<dyn std::error::Error>> {
         let config: V2Eip155ExactFacilitatorConfig = config
-            .and_then(|config| serde_json::from_value(config).ok())
+            .and_then(|config| V2Eip155ExactFacilitatorConfig::deserialize(config).ok())
             .unwrap_or_default();
         Ok(Box::new(V2Eip155ExactFacilitator::new(provider, config)))
     }
@@ -69,8 +72,8 @@ pub struct V2Eip155ExactFacilitatorConfig {
 ///   such as EIP-2612 gas sponsoring.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct V2Eip155ExactFacilitatorExtra {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extensions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
 }
 
 /// Facilitator for V2 EIP-155 exact scheme payments.
@@ -105,6 +108,12 @@ where
     P::Inner: Provider,
     Eip155ExactError: From<P::Error>,
 {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn verify(
         &self,
         request: &proto::VerifyRequest,
@@ -116,6 +125,12 @@ where
                 payment_requirements,
                 x402_version: _,
             } => {
+                #[cfg(feature = "telemetry")]
+                record_payment_context(
+                    &payment_payload.accepted.network,
+                    payment_payload.payload.authorization.from,
+                    payment_requirements.pay_to,
+                );
                 eip3009::verify_eip3009_payment(
                     &self.provider,
                     &payment_payload,
@@ -124,10 +139,19 @@ where
                 .await?
             }
             types::FacilitatorVerifyRequest::Permit2 {
-                payment_requirements,
                 payment_payload,
+                payment_requirements,
                 x402_version: _,
             } => {
+                #[cfg(feature = "telemetry")]
+                {
+                    let authorization = &payment_payload.payload.permit_2_authorization;
+                    record_payment_context(
+                        &payment_payload.accepted.network,
+                        authorization.from,
+                        payment_requirements.pay_to,
+                    );
+                }
                 permit2::verify_permit2_payment(
                     &self.provider,
                     self.eip2612_gas_sponsoring,
@@ -140,6 +164,12 @@ where
         Ok(verify_response.into())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn settle(
         &self,
         request: &proto::SettleRequest,
@@ -151,6 +181,12 @@ where
                 payment_requirements,
                 x402_version: _,
             } => {
+                #[cfg(feature = "telemetry")]
+                record_payment_context(
+                    &payment_payload.accepted.network,
+                    payment_payload.payload.authorization.from,
+                    payment_requirements.pay_to,
+                );
                 eip3009::settle_eip3009_payment(
                     &self.provider,
                     &payment_payload,
@@ -163,6 +199,15 @@ where
                 payment_payload,
                 x402_version: _,
             } => {
+                #[cfg(feature = "telemetry")]
+                {
+                    let authorization = &payment_payload.payload.permit_2_authorization;
+                    record_payment_context(
+                        &payment_payload.accepted.network,
+                        authorization.from,
+                        payment_requirements.pay_to,
+                    );
+                }
                 permit2::settle_permit2_payment(
                     &self.provider,
                     self.eip2612_gas_sponsoring,
@@ -182,10 +227,10 @@ where
         // This tells the client it may include an EIP-2612 permit in the payload,
         // allowing the facilitator to call `settleWithPermit` atomically.
         if self.eip2612_gas_sponsoring {
-            extensions.push(eip2612::EXTENSION_KEY.to_string());
+            extensions.push(Eip2612GasSponsoring::EXTENSION_KEY.to_string());
         }
         let extra = V2Eip155ExactFacilitatorExtra {
-            extensions: Some(extensions.clone()),
+            extensions: extensions.clone(),
         };
         let extra = serde_json::to_value(extra).ok();
         let kinds = vec![proto::SupportedPaymentKind {

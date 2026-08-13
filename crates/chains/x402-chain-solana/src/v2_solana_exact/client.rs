@@ -19,8 +19,8 @@ use alloy_primitives::U256;
 use async_trait::async_trait;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use x402_types::proto::v2::ResourceInfo;
 use x402_types::proto::v2::X402Version2;
+use x402_types::proto::v2::{ExtensionsJson, ResourceInfo};
 use x402_types::proto::{OriginalJson, PaymentRequired};
 use x402_types::scheme::X402SchemeId;
 use x402_types::scheme::client::{
@@ -96,6 +96,7 @@ where
                         signer: self.signer.clone(),
                         rpc_client: self.rpc_client.clone(),
                         resource: payment_required.resource.clone(),
+                        extensions: payment_required.extensions.clone(),
                         requirements,
                         requirements_json: original_requirements_json.clone(),
                     }),
@@ -112,6 +113,7 @@ struct PayloadSigner<S, R> {
     signer: S,
     rpc_client: R,
     resource: Option<ResourceInfo>,
+    extensions: ExtensionsJson,
     requirements: PaymentRequirements,
     requirements_json: OriginalJson,
 }
@@ -141,7 +143,7 @@ impl<S: Signer + Sync, R: RpcClientLike + Sync> PaymentCandidateSigner for Paylo
             payload: ExactSolanaPayload {
                 transaction: tx_b64,
             },
-            extensions: None,
+            extensions: self.extensions.clone(),
         };
         let json = serde_json::to_vec(&payload)?;
         let b64 = Base64Bytes::encode(&json);

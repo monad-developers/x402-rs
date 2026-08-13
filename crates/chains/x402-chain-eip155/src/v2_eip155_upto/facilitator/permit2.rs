@@ -1,4 +1,4 @@
-use alloy_primitives::{Bytes, TxHash, U256};
+use alloy_primitives::{Address, Bytes, TxHash, U256};
 use alloy_provider::{MulticallItem, Provider};
 use alloy_sol_types::{SolStruct, eip712_domain};
 use x402_types::chain::ChainProviderOps;
@@ -12,18 +12,22 @@ use tracing::instrument;
 
 use crate::chain::erc20::IERC20;
 use crate::chain::permit2::{PERMIT2_ADDRESS, UPTO_PERMIT2_PROXY_ADDRESS};
-use crate::chain::{Eip155ChainReference, Eip155MetaTransactionProvider, MetaTransaction};
+use crate::chain::{
+    Eip155ChainReference, Eip155MetaTransactionProvider, Eip155SignerAddresses, MetaTransaction,
+};
 use crate::v1_eip155_exact::{
     Eip155ExactError, StructuredSignature, VALIDATOR_ADDRESS, Validator6492, assert_time,
 };
+use crate::v2_eip155_exact::eip2612::assert_eip2612_offchain_valid;
 use crate::v2_eip155_exact::facilitator::permit2::{
     PreparedPermit2, assert_onchain_allowance, assert_onchain_balance, execute_permit2_settlement,
 };
-use crate::v2_eip155_upto::types;
+use crate::v2_eip155_upto::eip2612::Permit2PaymentPayloadExt;
 use crate::v2_eip155_upto::types::{
     ISignatureTransfer, Permit2PaymentPayload, Permit2PaymentRequirements,
     PermitWitnessTransferFrom, UptoSettleResponse, X402UptoPermit2Proxy, x402UptoPermit2Proxy,
 };
+use crate::v2_eip155_upto::{eip2612, types};
 
 /// Type alias for the upto-scheme prepared data.
 pub type PreparedUptoPermit2 =
@@ -84,26 +88,72 @@ impl PreparedUptoPermit2 {
 }
 
 #[cfg_attr(feature = "telemetry", instrument(skip_all, err))]
-pub async fn verify_permit2_payment<P: Eip155MetaTransactionProvider + ChainProviderOps>(
+pub async fn verify_permit2_payment<P: Eip155MetaTransactionProvider + Eip155SignerAddresses>(
     provider: &P,
+    eip2612_gas_sponsoring: bool,
     payment_payload: &Permit2PaymentPayload,
     payment_requirements: &Permit2PaymentRequirements,
 ) -> Result<v2::VerifyResponse, Eip155ExactError> {
     // 1. Verify offchain constraints
     let required_amount = assert_offchain_valid_verify(payment_payload, payment_requirements)?;
 
-    // 2. Verify onchain constraints
+    // 2. Verify the witness.facilitator is one of this facilitator's signer addresses
     let authorization = &payment_payload.payload.permit_2_authorization;
+    let witness_facilitator = &authorization.witness.facilitator;
+    assert_own_signer(provider, witness_facilitator.as_ref())?;
+
+    // 3. Verify onchain constraints
     let payer = authorization.from;
-    assert_onchain_upto_permit2(
-        provider.inner(),
-        provider.chain(),
-        payment_payload,
-        required_amount,
-    )
-    .await?;
+    let eip2612_payload = payment_payload.eip2612_gas_sponsoring();
+    if let Some(eip2612_gas_sponsoring_payload) = &eip2612_payload {
+        if !eip2612_gas_sponsoring {
+            return Err(PaymentVerificationError::eip2612_gas_sponsoring_not_enabled().into());
+        }
+        assert_eip2612_offchain_valid(eip2612_gas_sponsoring_payload, payment_payload)?;
+        eip2612::assert_onchain_upto_permit2_with_eip2612(
+            provider.inner(),
+            provider.chain(),
+            payment_payload,
+            eip2612_gas_sponsoring_payload,
+        )
+        .await?;
+    } else {
+        assert_onchain_upto_permit2(
+            provider.inner(),
+            provider.chain(),
+            payment_payload,
+            required_amount,
+        )
+        .await?;
+    }
 
     Ok(v2::VerifyResponse::valid(payer.to_string()))
+}
+
+/// Returns `Ok(())` if `witness_facilitator` matches one of the provider's own signer addresses,
+/// or an [`PaymentVerificationError::InvalidSignature`] error otherwise.
+///
+/// Called during verification to reject payments whose Permit2 witness names a different
+/// facilitator — preventing this facilitator from accidentally settling a payment that was
+/// authorized for a different one.
+pub fn assert_own_signer<P>(
+    provider: &P,
+    witness_facilitator: &Address,
+) -> Result<(), PaymentVerificationError>
+where
+    P: Eip155SignerAddresses,
+{
+    let signer_addresses = provider.signer_addresses();
+    let is_ours = signer_addresses
+        .iter()
+        .any(|addr| addr == witness_facilitator);
+    if is_ours {
+        Ok(())
+    } else {
+        Err(PaymentVerificationError::InvalidSignature(format!(
+            "witness facilitator address {witness_facilitator} does not match any of this facilitator's signer addresses"
+        )))
+    }
 }
 
 /// Settle a upto permit2 payment with a specific amount.
@@ -113,6 +163,7 @@ pub async fn verify_permit2_payment<P: Eip155MetaTransactionProvider + ChainProv
 #[cfg_attr(feature = "telemetry", instrument(skip_all, err))]
 pub async fn settle_permit2_payment<P, E>(
     provider: &P,
+    eip2612_gas_sponsoring: bool,
     payment_payload: &Permit2PaymentPayload,
     payment_requirements: &Permit2PaymentRequirements,
 ) -> Result<UptoSettleResponse, X402SchemeFacilitatorError>
@@ -128,7 +179,6 @@ where
 
     // 2. Handle zero settlement - no on-chain transaction needed
     // Allowing $0 settlements means unused authorizations naturally expire without on-chain transactions, reducing gas costs and blockchain bloat
-    // TODO Document this
     if required_amount.is_zero() {
         let network = &payment_payload.accepted.network;
         return Ok(UptoSettleResponse::success(
@@ -139,9 +189,19 @@ where
         ));
     }
 
-    // 3. Execute settlement
-    let tx_hash = settle_upto_permit2(provider, payment_payload, required_amount).await?;
-    let payer = authorization.from;
+    // 3. Execute settlement (with or without EIP-2612 permit)
+    let eip2612_payload = payment_payload.eip2612_gas_sponsoring();
+    let tx_hash = if let Some(ref info) = eip2612_payload {
+        if !eip2612_gas_sponsoring {
+            return Err(PaymentVerificationError::eip2612_gas_sponsoring_not_enabled().into());
+        }
+        assert_eip2612_offchain_valid(info, payment_payload)?;
+        eip2612::settle_upto_permit2_with_eip2612(provider, payment_payload, info, required_amount)
+            .await?
+    } else {
+        settle_upto_permit2(provider, payment_payload, required_amount).await?
+    };
+
     let network = &payment_payload.accepted.network;
 
     Ok(UptoSettleResponse::success(
@@ -267,6 +327,7 @@ pub async fn assert_onchain_upto_permit2<P: Provider>(
         witness,
     } = PreparedUptoPermit2::try_new(chain_reference, payment_payload)?;
 
+    let facilitator_address = witness.facilitator;
     let upto_permit2_proxy = X402UptoPermit2Proxy::new(UPTO_PERMIT2_PROXY_ADDRESS, provider);
     match structured_signature {
         StructuredSignature::EIP6492 {
@@ -279,13 +340,15 @@ pub async fn assert_onchain_upto_permit2<P: Provider>(
             let is_valid_signature_call =
                 validator6492.isValidSigWithSideEffects(payer, eip712_hash, original);
             // For verification, simulate with max amount
-            let settle_call = upto_permit2_proxy.settle(
-                permit_transfer_from,
-                authorization.permitted.amount,
-                payer,
-                witness,
-                inner,
-            );
+            let settle_call = upto_permit2_proxy
+                .settle(
+                    permit_transfer_from,
+                    authorization.permitted.amount,
+                    payer,
+                    witness,
+                    inner,
+                )
+                .from(facilitator_address);
             let aggregate3 = provider
                 .multicall()
                 .add(is_valid_signature_call)
@@ -319,13 +382,15 @@ pub async fn assert_onchain_upto_permit2<P: Provider>(
             Ok(())
         }
         StructuredSignature::EOA(signature) => {
-            let settle_call = upto_permit2_proxy.settle(
-                permit_transfer_from,
-                authorization.permitted.amount,
-                payer,
-                witness,
-                signature.as_bytes().into(),
-            );
+            let settle_call = upto_permit2_proxy
+                .settle(
+                    permit_transfer_from,
+                    authorization.permitted.amount,
+                    payer,
+                    witness,
+                    signature.as_ref().as_bytes().into(),
+                )
+                .from(facilitator_address);
             let settle_call_fut = settle_call.call().into_future();
             #[cfg(feature = "telemetry")]
             settle_call_fut
@@ -345,13 +410,15 @@ pub async fn assert_onchain_upto_permit2<P: Provider>(
             Ok(())
         }
         StructuredSignature::EIP1271(signature) => {
-            let settle_call = upto_permit2_proxy.settle(
-                permit_transfer_from,
-                authorization.permitted.amount,
-                payer,
-                witness,
-                signature,
-            );
+            let settle_call = upto_permit2_proxy
+                .settle(
+                    permit_transfer_from,
+                    authorization.permitted.amount,
+                    payer,
+                    witness,
+                    signature,
+                )
+                .from(facilitator_address);
             let settle_call_fut = settle_call.call().into_future();
             #[cfg(feature = "telemetry")]
             settle_call_fut
@@ -393,6 +460,7 @@ where
     let build_call = move |sig_bytes: Bytes| {
         let inner = provider.inner();
         let upto_permit2_proxy = X402UptoPermit2Proxy::new(UPTO_PERMIT2_PROXY_ADDRESS, inner);
+        let facilitator_address = witness.facilitator;
         let call = upto_permit2_proxy.settle(
             permit_transfer_from,
             actual_amount,
@@ -400,7 +468,9 @@ where
             witness,
             sig_bytes,
         );
-        MetaTransaction::new(call.target(), call.calldata().clone())
+        let to = call.target();
+        let calldata = call.calldata().clone();
+        MetaTransaction::new(to, calldata).with_from(facilitator_address)
     };
 
     execute_permit2_settlement(provider, payer, structured_signature, build_call).await

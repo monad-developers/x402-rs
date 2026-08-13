@@ -1,4 +1,5 @@
 use alloy_primitives::address;
+use axum::Extension;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -9,9 +10,11 @@ use std::env;
 use tracing::instrument;
 use x402_axum::X402Middleware;
 use x402_chain_eip155::chain::{AssetTransferMethod, Eip155TokenDeployment};
+use x402_chain_eip155::eip2612_gas_sponsoring::Eip2612GasSponsoring;
 use x402_chain_eip155::{KnownNetworkEip155, V1Eip155Exact, V2Eip155Exact, V2Eip155Upto};
 use x402_chain_solana::{KnownNetworkSolana, V1SolanaExact, V2SolanaExact};
 use x402_types::networks::USDC;
+use x402_types::proto::SettleResponse;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_reference: usdc_base_sepolia.chain_reference,
         address: usdc_base_sepolia.address,
         decimals: usdc_base_sepolia.decimals,
-        transfer_method: AssetTransferMethod::Permit2,
+        transfer_method: AssetTransferMethod::Permit2 {
+            name: "USDC".into(),
+            version: "2".into(),
+        },
     };
 
     let facilitator_url =
@@ -128,13 +134,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })),
         )
-        // TODO CONTINUE Set price (and feature-based docs.rs)
         .route(
             "/eip155-upto",
-            get(eip155_upto_handler).layer(x402.with_price_tag(V2Eip155Upto::price_tag(
-                address!("0xBAc675C310721717Cd4A37F6cbeA1F081b1C2a07"),
-                usdc_base_sepolia_permit2.amount(10u64),
-            ))),
+            get(eip155_upto_handler).layer(
+                x402.with_price_tag(V2Eip155Upto::price_tag(
+                    address!("0xBAc675C310721717Cd4A37F6cbeA1F081b1C2a07"),
+                    usdc_base_sepolia_permit2.amount(130u64),
+                ))
+                .with_extension(Eip2612GasSponsoring::server()),
+            ),
         );
 
     tracing::info!("Using facilitator on {}", x402.facilitator_url());
@@ -150,7 +158,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[instrument(skip_all)]
-async fn my_handler() -> impl IntoResponse {
+async fn my_handler(Extension(settlement): Extension<Option<SettleResponse>>) -> impl IntoResponse {
+    if let Some(settlement) = settlement {
+        tracing::info!(
+            settlement = ?settlement,
+            "Payment settled before execution"
+        );
+    } else {
+        tracing::info!("Payment will be settled after execution");
+    }
     (StatusCode::OK, "This is a VIP content!")
 }
 
