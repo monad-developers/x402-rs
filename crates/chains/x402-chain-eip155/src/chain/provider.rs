@@ -667,4 +667,25 @@ mod sync_send_tests {
             assert!(matches!(err, MetaTransactionSendError::Transport(_)));
         });
     }
+
+    /// The Asserter cannot inspect outgoing calls, but its empty-queue error names the
+    /// attempted JSON-RPC method. That pins the routing: the locally signed envelope must
+    /// go out as raw `eth_sendRawTransactionSync` (EIP-7966), never node-side
+    /// `eth_sendTransactionSync`.
+    #[test]
+    fn sync_send_uses_raw_sync_wire_method() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = mocked_provider(Asserter::new(), PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("eth_sendRawTransactionSync"),
+                "sync_send did not route to eth_sendRawTransactionSync: {msg}"
+            );
+        });
+    }
 }
