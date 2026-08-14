@@ -385,7 +385,8 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         if self.sync_send {
             self.send_sync(txr, from_address).await
         } else {
-            self.send_and_poll(txr, tx.confirmations, from_address).await
+            self.send_and_poll(txr, tx.confirmations, from_address)
+                .await
         }
     }
 }
@@ -595,7 +596,10 @@ mod sync_send_tests {
             GasFiller::default(),
             JoinFill::new(
                 BlobGasFiller::default(),
-                JoinFill::new(NonceFiller::new(nonce_manager.clone()), ChainIdFiller::default()),
+                JoinFill::new(
+                    NonceFiller::new(nonce_manager.clone()),
+                    ChainIdFiller::default(),
+                ),
             ),
         );
         let inner: InnerProvider = ProviderBuilder::default()
@@ -656,7 +660,10 @@ mod sync_send_tests {
             let provider = mocked_provider(asserter, PendingNonceManager::default());
             let from = provider.signer_addresses[0];
 
-            let err = provider.send_sync(prefilled_tx(from), from).await.unwrap_err();
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
             assert!(matches!(err, MetaTransactionSendError::Transport(_)));
         });
     }
