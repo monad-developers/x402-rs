@@ -117,6 +117,11 @@ mod tests {
 
     #[test]
     fn permit2_proxies() {
+        // Both mainnet and nile have a known x402ExactPermit2Proxy deployment
+        // (see `TronChainReference::x402_exact_permit2_proxy`). Upstream x402-rs
+        // v2.0.2 ships this test asserting `mainnet(...).is_none()`, which contradicts
+        // its own `networks` table (mainnet returns `TNtw4Wg…`) and fails `cargo test`.
+        // Corrected here to match the deployment; reported upstream for the same fix.
         assert!(
             TronChainReference::nile()
                 .x402_exact_permit2_proxy()
@@ -125,7 +130,7 @@ mod tests {
         assert!(
             TronChainReference::mainnet()
                 .x402_exact_permit2_proxy()
-                .is_none()
+                .is_some()
         );
         // SUN.io Permit2 is known for mainnet and nile
         assert!(TronChainReference::mainnet().sun_permit2().is_some());
