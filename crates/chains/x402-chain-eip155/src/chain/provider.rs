@@ -25,9 +25,7 @@ use tracing::Instrument;
 
 use crate::chain::config::{Eip155ChainConfig, RpcConfig};
 use crate::chain::pending_nonce_manager::PendingNonceManager;
-use crate::chain::permit2::{
-    EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS, UPTO_PERMIT2_PROXY_ADDRESS,
-};
+use crate::chain::permit2::{EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS};
 use crate::chain::types::Eip155ChainReference;
 use crate::v1_eip155_exact::VALIDATOR_ADDRESS;
 
@@ -37,12 +35,11 @@ pub type InnerFiller = JoinFill<
     JoinFill<BlobGasFiller, JoinFill<NonceFiller<PendingNonceManager>, ChainIdFiller>>,
 >;
 
-const REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
+static REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
     vec![
         VALIDATOR_ADDRESS,
         PERMIT2_ADDRESS,
         EXACT_PERMIT2_PROXY_ADDRESS,
-        UPTO_PERMIT2_PROXY_ADDRESS,
     ]
 });
 
@@ -79,6 +76,7 @@ pub struct Eip155ChainProvider {
     chain: Eip155ChainReference,
     eip1559: bool,
     flashblocks: bool,
+    /// Whether to submit transactions via `eth_sendRawTransactionSync` (EIP-7966).
     sync_send: bool,
     receipt_timeout_secs: u64,
     inner: InnerProvider,
@@ -124,6 +122,8 @@ impl Eip155ChainProvider {
             )
             .service(transports);
         let client = RpcClient::new(fallback, false);
+        // Override the receipt poll interval on fast-finality chains (e.g. Monad).
+        // Ignored when `sync_send` is enabled (no polling occurs in that path).
         if let Some(ms) = poll_interval_ms {
             client.with_poll_interval(std::time::Duration::from_millis(ms))
         } else {
@@ -140,6 +140,70 @@ impl Eip155ChainProvider {
             let next =
                 self.signer_cursor.fetch_add(1, Ordering::Relaxed) % self.signer_addresses.len();
             self.signer_addresses[next]
+        }
+    }
+
+    /// Submit `txr` via `eth_sendRawTransactionSync` (EIP-7966): alloy fills and locally
+    /// signs the transaction, then sends the raw signed envelope and returns the receipt
+    /// in a single RPC round-trip — no separate send + poll.
+    ///
+    /// Bounded by `receipt_timeout_secs` as a client-side timeout: the HTTP transport has
+    /// no request timeout of its own, so without this bound a stalled RPC would hold the
+    /// settle handler open indefinitely (whereas the poll path frees it after its timeout).
+    /// On any failure the nonce is reset so the next attempt re-queries it — a transaction
+    /// that lands after a timeout is still counted by the pending-nonce requery.
+    async fn send_sync(
+        &self,
+        txr: TransactionRequest,
+        from_address: Address,
+    ) -> Result<TransactionReceipt, MetaTransactionSendError> {
+        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
+        match tokio::time::timeout(timeout, self.inner.send_transaction_sync(txr)).await {
+            Ok(Ok(receipt)) => Ok(receipt),
+            Ok(Err(e)) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::Transport(e))
+            }
+            Err(_elapsed) => {
+                // The node accepted the request but returned no receipt in time. The tx may
+                // still land, so this is surfaced distinctly from a submission failure.
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::Custom(format!(
+                    "sync_send receipt not returned within {}s",
+                    self.receipt_timeout_secs
+                )))
+            }
+        }
+    }
+
+    /// Standard path: submit the transaction, then poll for the receipt up to
+    /// `receipt_timeout_secs`, waiting for `confirmations` confirmations. On any failure
+    /// the nonce is reset so the next attempt re-queries it.
+    async fn send_and_poll(
+        &self,
+        txr: TransactionRequest,
+        confirmations: u64,
+        from_address: Address,
+    ) -> Result<TransactionReceipt, MetaTransactionSendError> {
+        let pending_tx = match self.inner.send_transaction(txr).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                return Err(MetaTransactionSendError::Transport(e));
+            }
+        };
+
+        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
+        let watcher = pending_tx
+            .with_required_confirmations(confirmations)
+            .with_timeout(Some(timeout));
+
+        match watcher.get_receipt().await {
+            Ok(receipt) => Ok(receipt),
+            Err(e) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::PendingTransaction(e))
+            }
         }
     }
 }
@@ -195,7 +259,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         // Build the filler stack: Gas -> BlobGas -> Nonce -> ChainId
         // This mirrors the InnerFiller type but with our custom nonce manager
         let filler = JoinFill::new(
-            GasFiller,
+            GasFiller::default(),
             JoinFill::new(
                 BlobGasFiller::default(),
                 JoinFill::new(
@@ -289,7 +353,7 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         &self,
         tx: MetaTransaction,
     ) -> Result<TransactionReceipt, Self::Error> {
-        let from_address = self.next_signer_address();
+        let from_address = tx.from.unwrap_or_else(|| self.next_signer_address());
         let mut txr = TransactionRequest::default()
             .with_to(tx.to)
             .with_from(from_address)
@@ -319,36 +383,10 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         }
 
         if self.sync_send {
-            // EIP-7966: single RPC call returns receipt directly, no polling
-            match self.inner.send_transaction_sync(txr).await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::Transport(e))
-                }
-            }
+            self.send_sync(txr, from_address).await
         } else {
-            // Standard: send + poll for receipt
-            let pending_tx = match self.inner.send_transaction(txr).await {
-                Ok(pending) => pending,
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    return Err(MetaTransactionSendError::Transport(e));
-                }
-            };
-
-            let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
-            let watcher = pending_tx
-                .with_required_confirmations(tx.confirmations)
-                .with_timeout(Some(timeout));
-
-            match watcher.get_receipt().await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::PendingTransaction(e))
-                }
-            }
+            self.send_and_poll(txr, tx.confirmations, from_address)
+                .await
         }
     }
 }
@@ -377,6 +415,33 @@ impl ChainProviderOps for Eip155ChainProvider {
     }
 }
 
+/// Provides access to the EIP-155 signer addresses held by a facilitator provider.
+///
+/// Implementations return the set of addresses whose private keys the provider
+/// controls and can use to submit on-chain transactions. The facilitator exposes
+/// one of these addresses to clients via the `supported()` endpoint so they can
+/// embed it in the Permit2 witness, ensuring only this facilitator can settle the
+/// authorized payment.
+pub trait Eip155SignerAddresses {
+    /// Returns an iterator over the signer addresses available on this provider.
+    fn signer_addresses(&self) -> Vec<Address>;
+}
+
+impl<T> Eip155SignerAddresses for Arc<T>
+where
+    T: Eip155SignerAddresses,
+{
+    fn signer_addresses(&self) -> Vec<Address> {
+        (**self).signer_addresses()
+    }
+}
+
+impl Eip155SignerAddresses for Eip155ChainProvider {
+    fn signer_addresses(&self) -> Vec<Address> {
+        (*self.signer_addresses).clone()
+    }
+}
+
 /// Meta-transaction parameters: target address, calldata, and required confirmations.
 pub struct MetaTransaction {
     /// Target contract address.
@@ -385,6 +450,8 @@ pub struct MetaTransaction {
     pub calldata: Bytes,
     /// Number of block confirmations to wait for.
     pub confirmations: u64,
+    /// Optional sender address.
+    pub from: Option<Address>,
 }
 
 impl MetaTransaction {
@@ -393,7 +460,13 @@ impl MetaTransaction {
             to,
             calldata,
             confirmations: 1,
+            from: None,
         }
+    }
+
+    pub fn with_from(mut self, from: Address) -> Self {
+        self.from = Some(from);
+        self
     }
 }
 
@@ -449,4 +522,170 @@ pub async fn assert_contracts_exists<P: Provider>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sync_send_tests {
+    //! Mock-`Asserter` coverage for the `sync_send` (EIP-7966) submission path.
+    //!
+    //! No live node. The request is fully pre-filled so the fillers issue no RPCs, and
+    //! the heartbeat block-poller stays paused (it only unpauses once a pending-tx
+    //! watcher is registered, which `send_transaction_sync` never does). So the only
+    //! outbound call is `eth_sendRawTransactionSync`, which consumes the single queued
+    //! receipt. The wallet filler signs locally — converting the request into an
+    //! envelope, which is what routes alloy to `send_raw_transaction_sync` (raw) rather
+    //! than node-side `eth_sendTransactionSync`.
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use alloy_network::{EthereumWallet, TransactionBuilder};
+    use alloy_primitives::{Address, Bytes, U256, address};
+    use alloy_provider::ProviderBuilder;
+    use alloy_provider::fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller};
+    use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
+    use alloy_signer::Signer;
+    use alloy_signer_local::PrivateKeySigner;
+    use alloy_transport::mock::Asserter;
+
+    use super::{Eip155ChainProvider, InnerProvider, MetaTransactionSendError};
+    use crate::chain::pending_nonce_manager::PendingNonceManager;
+    use crate::chain::types::Eip155ChainReference;
+
+    const CHAIN_ID: u64 = 10143; // Monad testnet
+    // Deterministic throwaway key (never used on-chain).
+    const TEST_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    // A known-good, deserializable successful receipt.
+    fn canned_receipt() -> TransactionReceipt {
+        serde_json::from_str(
+            r#"{
+                "transactionHash": "0xea1093d492a1dcb1bef708f771a99a96ff05dcab81ca76c31940300177fcf49f",
+                "blockHash": "0x8e38b4dbf6b11fcc3b9dee84fb7986e29ca0a02cecd8977c161ff7333329681e",
+                "blockNumber": "0xf4240",
+                "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "gasUsed": "0x723c",
+                "status": "0x1",
+                "contractAddress": null,
+                "cumulativeGasUsed": "0x723c",
+                "transactionIndex": "0x0",
+                "from": "0x39fa8c5f2793459d6622857e7d9fbb4bd91766d3",
+                "to": "0xc083e9947cf02b8ffc7d3090ae9aea72df98fd47",
+                "type": "0x0",
+                "effectiveGasPrice": "0x12bfb19e60",
+                "logs": []
+            }"#,
+        )
+        .expect("canned receipt should deserialize")
+    }
+
+    fn mocked_provider(
+        asserter: Asserter,
+        nonce_manager: PendingNonceManager,
+    ) -> Eip155ChainProvider {
+        let signer = TEST_KEY
+            .parse::<PrivateKeySigner>()
+            .expect("valid test key")
+            .with_chain_id(Some(CHAIN_ID));
+        let signer_addr = signer.address();
+        let wallet = EthereumWallet::from(signer);
+
+        // Mirror `from_config`'s filler stack (Gas -> BlobGas -> Nonce -> ChainId),
+        // but connect a mocked client instead of live transports.
+        let filler = JoinFill::new(
+            GasFiller::default(),
+            JoinFill::new(
+                BlobGasFiller::default(),
+                JoinFill::new(
+                    NonceFiller::new(nonce_manager.clone()),
+                    ChainIdFiller::default(),
+                ),
+            ),
+        );
+        let inner: InnerProvider = ProviderBuilder::default()
+            .filler(filler)
+            .wallet(wallet)
+            .connect_mocked_client(asserter);
+
+        Eip155ChainProvider {
+            chain: Eip155ChainReference::new(CHAIN_ID),
+            eip1559: false,
+            flashblocks: false,
+            sync_send: true,
+            receipt_timeout_secs: 30,
+            inner,
+            signer_addresses: Arc::new(vec![signer_addr]),
+            signer_cursor: Arc::new(AtomicUsize::new(0)),
+            nonce_manager,
+        }
+    }
+
+    // Fully specified so no filler needs an RPC. Legacy (gas_price) keeps signing simple.
+    fn prefilled_tx(from: Address) -> TransactionRequest {
+        TransactionRequest::default()
+            .with_from(from)
+            .with_to(address!("00000000000000000000000000000000000000aa"))
+            .with_input(Bytes::from_static(&[0x00]))
+            .with_value(U256::ZERO)
+            .with_nonce(0)
+            .with_gas_limit(21_000)
+            .with_gas_price(20_000_000_000u128)
+            .with_chain_id(CHAIN_ID)
+    }
+
+    #[test]
+    fn sync_send_submits_raw_and_returns_receipt() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let asserter = Asserter::new();
+            let receipt = canned_receipt();
+            asserter.push_success(&receipt);
+
+            let provider = mocked_provider(asserter, PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+
+            let got = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .expect("sync_send should return the mocked receipt");
+            assert_eq!(got.transaction_hash, receipt.transaction_hash);
+        });
+    }
+
+    #[test]
+    fn sync_send_error_maps_to_transport() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let asserter = Asserter::new();
+            asserter.push_failure_msg("node rejected submission");
+
+            let provider = mocked_provider(asserter, PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MetaTransactionSendError::Transport(_)));
+        });
+    }
+
+    /// The Asserter cannot inspect outgoing calls, but its empty-queue error names the
+    /// attempted JSON-RPC method. That pins the routing: the locally signed envelope must
+    /// go out as raw `eth_sendRawTransactionSync` (EIP-7966), never node-side
+    /// `eth_sendTransactionSync`.
+    #[test]
+    fn sync_send_uses_raw_sync_wire_method() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = mocked_provider(Asserter::new(), PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("eth_sendRawTransactionSync"),
+                "sync_send did not route to eth_sendRawTransactionSync: {msg}"
+            );
+        });
+    }
 }

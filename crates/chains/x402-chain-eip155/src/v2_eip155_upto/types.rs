@@ -3,7 +3,7 @@
 //! This module defines types for the "upto" scheme which authorizes a transfer
 //! of up to a maximum amount, where the actual amount is determined at settlement.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use x402_types::proto::v2;
 use x402_types::{lit_str, proto};
@@ -13,16 +13,25 @@ use crate::chain::permit2::UptoPermit2Payload;
 
 lit_str!(UptoScheme, "upto");
 
-/// `PaymentRequirements.extra` shape for the upto scheme.
+/// Extra metadata returned by the facilitator's `supported()` endpoint for the upto scheme,
+/// and injected into payment requirements so the client can embed the facilitator address
+/// in the Permit2 witness.
 ///
-/// Servers MUST advertise the facilitator EOA that will execute on-chain settlement;
-/// clients sign this address into the witness so the proxy can enforce that
-/// `msg.sender == witness.facilitator` at settle time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// This struct holds additional response data returned by the facilitator's
+/// `supported` method, including supported extensions.
+///
+/// # Fields
+///
+/// - `extensions`: Optional list of supported extension identifiers.
+///   These extensions indicate additional features the facilitator supports,
+///   such as EIP-2612 gas sponsoring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct UptoExtra {
-    /// The facilitator EOA authorized to invoke `settle` on the proxy.
-    pub facilitator_address: Address,
+pub struct UptoSupportedExtra<TAddress = String> {
+    /// The facilitator address the client must place in `witness.facilitator`.
+    pub facilitator_address: TAddress,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
 }
 
 /// Type alias for V2 verify requests using the upto EVM payment scheme.
@@ -102,7 +111,11 @@ pub type PaymentRequirements = v2::PaymentRequirements<UptoScheme, U256, Checksu
 
 #[cfg(any(feature = "facilitator", feature = "client"))]
 pub mod facilitator_client_only {
+    use alloy_primitives::U256;
     use alloy_sol_types::sol;
+
+    use crate::chain::EOASignatureExt;
+    use crate::eip2612_gas_sponsoring::Eip2612GasSponsoringInfo;
 
     sol!(
         #[allow(missing_docs)]
@@ -114,6 +127,27 @@ pub mod facilitator_client_only {
     );
 
     sol!(
+        #[allow(missing_docs)]
+        #[allow(clippy::too_many_arguments)]
+        #[derive(Debug)]
+        #[sol(rpc)]
+        IERC20Permit,
+        "abi/IERC20Permit.json"
+    );
+
+    impl From<&Eip2612GasSponsoringInfo> for x402UptoPermit2Proxy::EIP2612Permit {
+        fn from(value: &Eip2612GasSponsoringInfo) -> Self {
+            Self {
+                value: value.amount,
+                deadline: U256::from(value.deadline.as_secs()),
+                r: value.signature.r_bytes(),
+                s: value.signature.s_bytes(),
+                v: value.signature.v_legacy(),
+            }
+        }
+    }
+
+    sol!(
         /// Signature struct to do settle through [`X402UptoPermit2Proxy`]
         #[allow(clippy::too_many_arguments)]
         #[derive(Debug)]
@@ -122,13 +156,46 @@ pub mod facilitator_client_only {
             address spender;
             uint256 nonce;
             uint256 deadline;
-            // Cross-`sol!` struct reference: `x402UptoPermit2Proxy.Witness` is
-            // emitted by the JSON-ABI macro above. Alloy resolves these by name
-            // at code-gen time, so the reference is valid even though the type
-            // is defined in a separate `sol!` invocation.
             x402UptoPermit2Proxy.Witness witness;
         }
     );
+
+    #[cfg(test)]
+    mod tests {
+        use alloy_primitives::{B256, b256, keccak256};
+        use alloy_sol_types::SolStruct;
+
+        use super::x402UptoPermit2Proxy;
+
+        /// Pins the upto Permit2 `Witness` EIP-712 type to its canonical on-chain
+        /// definition.
+        ///
+        /// The first assertion ties the check to the `sol!`-generated
+        /// [`x402UptoPermit2Proxy::Witness`] (derived from
+        /// `abi/X402UptoPermit2Proxy.json`), so a field reorder or rename in the ABI
+        /// fails the test. A bare `keccak256` of a hardcoded string would instead stay
+        /// green while every signing hash silently changed and interop with `@x402/evm`
+        /// clients broke. The second assertion keeps the concrete typehash pinned; it
+        /// equals `WITNESS_TYPEHASH()` on `0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002`
+        /// (identical on Base and Monad mainnet).
+        #[test]
+        fn upto_witness_eip712_type_is_canonical() {
+            const CANONICAL: &str = "Witness(address to,address facilitator,uint256 validAfter)";
+            const EXPECTED_TYPEHASH: B256 =
+                b256!("0xd4171c445a74218b01d4fd8af34ff1106580ea1e36ff837e64484bfaa2253b75");
+
+            assert_eq!(
+                &*<x402UptoPermit2Proxy::Witness as SolStruct>::eip712_root_type(),
+                CANONICAL,
+                "upto witness EIP-712 type drifted from the canonical on-chain definition"
+            );
+            assert_eq!(
+                keccak256(CANONICAL.as_bytes()),
+                EXPECTED_TYPEHASH,
+                "upto witness typehash drifted from the canonical on-chain value"
+            );
+        }
+    }
 }
 
 #[cfg(any(feature = "facilitator", feature = "client"))]

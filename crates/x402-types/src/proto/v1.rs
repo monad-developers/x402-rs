@@ -207,7 +207,7 @@ impl TryFrom<proto::VerifyResponse> for VerifyResponse {
     type Error = serde_json::Error;
     fn try_from(value: proto::VerifyResponse) -> Result<Self, Self::Error> {
         let json = value.0;
-        serde_json::from_value(json)
+        Self::deserialize(json)
     }
 }
 
@@ -298,15 +298,15 @@ pub struct VerifyRequest<TPayload, TRequirements> {
     pub payment_requirements: TRequirements,
 }
 
-impl<TPayload, TRequirements> VerifyRequest<TPayload, TRequirements>
+impl<TPayload, TRequirements> TryFrom<&proto::VerifyRequest>
+    for VerifyRequest<TPayload, TRequirements>
 where
     Self: DeserializeOwned,
 {
-    pub fn from_proto(
-        // FIXME REMOVE THIS
-        request: proto::VerifyRequest,
-    ) -> Result<Self, proto::PaymentVerificationError> {
-        let value = serde_json::from_str(request.as_str())?;
+    type Error = proto::PaymentVerificationError;
+
+    fn try_from(value: &proto::VerifyRequest) -> Result<Self, Self::Error> {
+        let value = serde_json::from_str(value.as_str())?;
         Ok(value)
     }
 }

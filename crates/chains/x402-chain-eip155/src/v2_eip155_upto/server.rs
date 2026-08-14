@@ -1,52 +1,33 @@
 //! Server-side price tag generation for V2 EIP-155 upto scheme.
 //!
-//! Servers MUST pass the facilitator EOA address so it can be bound into the
-//! Permit2 witness: the canonical `x402UptoPermit2Proxy` enforces
-//! `msg.sender == witness.facilitator` at settle time.
+//! The upto price tag includes an enricher that injects the facilitator's address
+//! into the payment requirements `extra` field. The client reads this address and
+//! embeds it in the Permit2 witness so only the authorized facilitator can settle.
 
-use alloy_primitives::{Address, U256};
+use std::sync::Arc;
+
+use alloy_primitives::U256;
 use x402_types::chain::{ChainId, DeployedTokenAmount};
+use x402_types::proto;
 use x402_types::proto::v2;
 
 use crate::V2Eip155Upto;
 use crate::chain::{ChecksummedAddress, Eip155TokenDeployment};
-use crate::v2_eip155_upto::types::{UptoExtra, UptoScheme};
+use crate::v2_eip155_upto::types::UptoScheme;
 
 impl V2Eip155Upto {
     /// Creates a V2 price tag for an upto payment on an EVM chain.
     ///
-    /// # Parameters
-    ///
-    /// - `pay_to`: The recipient address
-    /// - `asset`: The token deployment and maximum amount authorized
-    /// - `facilitator_address`: The facilitator EOA that will execute on-chain settlement;
-    ///   bound into the Permit2 witness and enforced by the proxy as `msg.sender`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use alloy_primitives::address;
-    /// use x402_chain_eip155::{V2Eip155Upto, KnownNetworkEip155};
-    /// use x402_types::networks::USDC;
-    ///
-    /// let usdc = USDC::base();
-    /// let price_tag = V2Eip155Upto::price_tag(
-    ///     "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
-    ///     usdc.amount(5_000_000u64), // up to 5 USDC
-    ///     address!("0x0000000000000000000000000000000000000000"),
-    /// );
-    /// ```
+    /// The returned price tag includes an enricher that populates
+    /// `extra.facilitatorAddress` from the facilitator's `supported()` response,
+    /// which is required by the client when signing the Permit2 witness.
     #[allow(dead_code)] // Public for consumption by downstream crates.
     pub fn price_tag<A: Into<ChecksummedAddress>>(
         pay_to: A,
         asset: DeployedTokenAmount<U256, Eip155TokenDeployment>,
-        facilitator_address: Address,
     ) -> v2::PriceTag {
         let chain_id: ChainId = asset.token.chain_reference.into();
-        let extra = Some(
-            serde_json::to_value(UptoExtra { facilitator_address })
-                .expect("UptoExtra is always serializable"),
-        );
+        let extra = serde_json::to_value(asset.token.transfer_method).ok();
         let requirements = v2::PaymentRequirements {
             scheme: UptoScheme.to_string(),
             pay_to: pay_to.into().to_string(),
@@ -58,7 +39,37 @@ impl V2Eip155Upto {
         };
         v2::PriceTag {
             requirements,
-            enricher: None,
+            enricher: Some(Arc::new(upto_facilitator_address_enricher)),
         }
+    }
+}
+
+/// Enricher that copies `facilitatorAddress` from the facilitator's `supported()` extra
+/// into the price tag's payment requirements extra field.
+pub fn upto_facilitator_address_enricher(
+    price_tag: &mut v2::PriceTag,
+    capabilities: &proto::SupportedResponse,
+) {
+    let supported_extra = capabilities
+        .kinds
+        .iter()
+        .find(|kind| {
+            v2::X402Version2 == kind.x402_version
+                && kind.scheme == UptoScheme.to_string()
+                && kind.network == price_tag.requirements.network.to_string()
+        })
+        .and_then(|kind| kind.extra.clone());
+    if let Some(supported_extra) = supported_extra {
+        if let Some(existing_extra) = price_tag.requirements.extra.as_mut() {
+            merge(existing_extra, supported_extra);
+        } else {
+            price_tag.requirements.extra = Some(supported_extra.clone());
+        }
+    }
+}
+
+fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+    if let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (a, b) {
+        a.extend(b);
     }
 }

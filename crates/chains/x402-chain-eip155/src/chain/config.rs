@@ -102,7 +102,10 @@ pub struct Eip155ChainConfigInner {
     /// When enabled, transactions are sent synchronously and the receipt is returned in a
     /// single RPC call, eliminating the polling loop entirely.
     /// Only supported by chains that implement EIP-7966 (e.g., Monad).
-    /// When `true`, `poll_interval_ms` and `receipt_timeout_secs` have no effect on settlement.
+    /// When `true`, `poll_interval_ms` and the transaction's `confirmations` have no effect
+    /// on settlement — the receipt is returned at inclusion (one-confirmation semantics).
+    /// `receipt_timeout_secs` still applies, bounding the synchronous call as a client-side
+    /// timeout.
     /// Default: false (uses standard send + poll).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sync_send: bool,

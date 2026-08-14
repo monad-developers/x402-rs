@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use x402_types::chain::ChainProviderOps;
 use x402_types::proto;
@@ -5,6 +6,8 @@ use x402_types::proto::v2;
 use x402_types::scheme::{
     X402SchemeFacilitator, X402SchemeFacilitatorBuilder, X402SchemeFacilitatorError,
 };
+#[cfg(feature = "telemetry")]
+use x402_types::util::telemetry::{record_chain_and_pay_to, record_payer};
 
 use crate::V2SolanaExact;
 use crate::chain::provider::SolanaChainProviderLike;
@@ -28,7 +31,7 @@ where
         config: Option<serde_json::Value>,
     ) -> Result<Box<dyn X402SchemeFacilitator>, Box<dyn std::error::Error>> {
         let config = config
-            .map(serde_json::from_value::<V2SolanaExactFacilitatorConfig>)
+            .map(V2SolanaExactFacilitatorConfig::deserialize)
             .transpose()?
             .unwrap_or_default();
 
@@ -52,22 +55,46 @@ impl<P> X402SchemeFacilitator for V2SolanaExactFacilitator<P>
 where
     P: SolanaChainProviderLike + ChainProviderOps + Send + Sync,
 {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn verify(
         &self,
         request: &proto::VerifyRequest,
     ) -> Result<proto::VerifyResponse, X402SchemeFacilitatorError> {
-        let request = types::VerifyRequest::from_proto(request.clone())?;
+        let request = types::VerifyRequest::try_from(request)?;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_chain_and_pay_to(&chain_id, &request.payment_requirements.pay_to);
         let verification = verify_transfer(&self.provider, &request, &self.config).await?;
+        #[cfg(feature = "telemetry")]
+        record_payer(&verification.payer);
         Ok(v2::VerifyResponse::valid(verification.payer.to_string()).into())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+        otel.kind = "internal",
+        chain_id = tracing::field::Empty,
+        payer = tracing::field::Empty,
+        pay_to = tracing::field::Empty
+    )))]
     async fn settle(
         &self,
         request: &proto::SettleRequest,
     ) -> Result<proto::SettleResponse, X402SchemeFacilitatorError> {
-        let request = types::SettleRequest::from_proto(request.clone())?;
+        let request = types::SettleRequest::try_from(request)?;
+        #[cfg(feature = "telemetry")]
+        let chain_id = self.provider.chain_id();
+        #[cfg(feature = "telemetry")]
+        record_chain_and_pay_to(&chain_id, &request.payment_requirements.pay_to);
         let verification = verify_transfer(&self.provider, &request, &self.config).await?;
         let payer = verification.payer.to_string();
+        #[cfg(feature = "telemetry")]
+        record_payer(&payer);
         let tx_sig = settle_transaction(&self.provider, verification).await?;
         Ok(v2::SettleResponse::Success {
             payer,
@@ -103,6 +130,12 @@ where
     }
 }
 
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, err, fields(
+    otel.kind = "internal",
+    chain_id = tracing::field::Empty,
+    payer = tracing::field::Empty,
+    pay_to = tracing::field::Empty
+)))]
 pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
     provider: &P,
     request: &types::VerifyRequest,
@@ -117,6 +150,8 @@ pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
     }
 
     let chain_id = provider.chain_id();
+    #[cfg(feature = "telemetry")]
+    record_chain_and_pay_to(&chain_id, &requirements.pay_to);
     let payload_chain_id = &accepted.network;
     if payload_chain_id != &chain_id {
         return Err(proto::PaymentVerificationError::UnsupportedChain);
@@ -127,11 +162,14 @@ pub async fn verify_transfer<P: SolanaChainProviderLike + ChainProviderOps>(
         asset: &requirements.asset,
         amount: requirements.amount.inner(),
     };
-    verify_transaction(
+    let result = verify_transaction(
         provider,
         transaction_b64_string,
         &transfer_requirement,
         config,
     )
-    .await
+    .await?;
+    #[cfg(feature = "telemetry")]
+    record_payer(&result.payer);
+    Ok(result)
 }

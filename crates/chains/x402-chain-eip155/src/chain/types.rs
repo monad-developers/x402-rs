@@ -12,6 +12,8 @@ use std::str::FromStr;
 use x402_types::chain::{ChainId, DeployedTokenAmount};
 use x402_types::util::money_amount::{MoneyAmount, MoneyAmountParseError};
 
+pub use x402_types::util::DecimalU256;
+
 /// An Ethereum address that serializes with EIP-55 checksum encoding.
 ///
 /// This wrapper ensures addresses are always serialized in checksummed format
@@ -81,82 +83,9 @@ impl PartialEq<ChecksummedAddress> for Address {
     }
 }
 
-/// A `U256` amount that serializes/deserializes as a decimal string.
-///
-/// The x402 V2 wire format encodes payment amounts as decimal strings
-/// (e.g., `"10000"` for 10000 token units). Alloy's default `U256` serde
-/// implementation uses hex encoding, so this newtype provides correct
-/// decimal-string handling for V2 payment requirements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DecimalU256(pub U256);
-
-impl From<DecimalU256> for U256 {
-    fn from(v: DecimalU256) -> Self {
-        v.0
-    }
-}
-
-impl fmt::Display for DecimalU256 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<U256> for DecimalU256 {
-    fn from(v: U256) -> Self {
-        Self(v)
-    }
-}
-
-impl Serialize for DecimalU256 {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for DecimalU256 {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct DecimalU256Visitor;
-        impl<'de> serde::de::Visitor<'de> for DecimalU256Visitor {
-            type Value = DecimalU256;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a decimal string or integer representing a U256 amount")
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<DecimalU256, E> {
-                U256::from_str_radix(v, 10)
-                    .map(DecimalU256)
-                    .map_err(|e| E::custom(format!("invalid decimal U256: {e}")))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<DecimalU256, E> {
-                Ok(DecimalU256(U256::from(v)))
-            }
-            fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<DecimalU256, E> {
-                Ok(DecimalU256(U256::from(v)))
-            }
-        }
-        deserializer.deserialize_any(DecimalU256Visitor)
-    }
-}
-
-pub mod decimal_u256 {
-    use alloy_primitives::U256;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    /// Serialize a U256 as a decimal string.
-    pub fn serialize<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&value.to_string())
-    }
-
-    /// Deserialize a decimal string into a U256.
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        U256::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
+impl AsRef<Address> for ChecksummedAddress {
+    fn as_ref(&self) -> &Address {
+        &self.0
     }
 }
 
@@ -306,7 +235,12 @@ pub enum AssetTransferMethod {
     },
     /// Permit2 transfer method.
     #[serde(rename = "permit2")]
-    Permit2,
+    Permit2 {
+        /// The token name as specified in the EIP-712 domain.
+        name: String,
+        /// The token version as specified in the EIP-712 domain.
+        version: String,
+    },
 }
 
 impl<'de> Deserialize<'de> for AssetTransferMethod {
@@ -320,10 +254,12 @@ impl<'de> Deserialize<'de> for AssetTransferMethod {
         #[serde(untagged)]
         #[allow(dead_code)]
         enum AssetTransferMethodWire {
-            // { "assetTransferMethod": "permit2" }
+            // { "assetTransferMethod": "permit2", "name": "...", "version": "..." }
             Permit2Tagged {
                 #[serde(rename = "assetTransferMethod")]
                 asset_transfer_method: Permit2Tag,
+                name: String,
+                version: String,
             },
             // { "assetTransferMethod": "eip3009", "name": "...", "version": "..." }
             Eip3009Tagged {
@@ -355,8 +291,9 @@ impl<'de> Deserialize<'de> for AssetTransferMethod {
             .map_err(|e| serde::de::Error::custom(format!("invalid asset transfer method: {e}")))?;
 
         Ok(match wire {
-            AssetTransferMethodWire::Permit2Tagged { .. } => AssetTransferMethod::Permit2,
-
+            AssetTransferMethodWire::Permit2Tagged { name, version, .. } => {
+                AssetTransferMethod::Permit2 { name, version }
+            }
             AssetTransferMethodWire::Eip3009Tagged { name, version, .. }
             | AssetTransferMethodWire::Eip3009Implicit { name, version } => {
                 AssetTransferMethod::Eip3009 { name, version }
@@ -427,12 +364,38 @@ impl Eip155TokenDeployment {
     }
 }
 
+/// A newtype wrapper around an alloy [`Signature`] that serializes/deserializes as a
+/// `0x`-prefixed 65-byte hex string (the canonical Ethereum externally-owned-account
+/// signature encoding: `r || s || v`).
+///
+/// Use this type wherever a payment payload or authorization struct needs to carry an
+/// EOA signature over the wire as JSON. The inner [`Signature`] is accessible via
+/// [`AsRef`], and the individual `r`, `s`, `v` components are available through the
+/// [`EOASignatureExt`] trait.
 #[derive(Debug, Clone, Copy)]
-pub struct EOASignature(Signature); // FIXME Add to EOA variant
+pub struct EOASignature(Signature);
+
+impl EOASignature {
+    pub fn new(sig: Signature) -> Self {
+        Self(sig)
+    }
+}
 
 impl AsRef<Signature> for EOASignature {
     fn as_ref(&self) -> &Signature {
         &self.0
+    }
+}
+
+impl From<EOASignature> for Signature {
+    fn from(sig: EOASignature) -> Self {
+        sig.0
+    }
+}
+
+impl From<Signature> for EOASignature {
+    fn from(sig: Signature) -> Self {
+        Self(sig)
     }
 }
 
@@ -487,9 +450,17 @@ impl<'de> Deserialize<'de> for EOASignature {
     }
 }
 
+/// Extension trait for extracting the raw `r`, `s`, and `v` components from an Ethereum
+/// signature in the legacy encoding expected by EIP-2612 `permit()` and similar contracts.
+///
+/// Implemented for both [`EOASignature`] and the underlying alloy [`Signature`].
 pub trait EOASignatureExt {
+    /// Returns the `r` component as a 32-byte big-endian value.
     fn r_bytes(&self) -> B256;
+    /// Returns the `s` component as a 32-byte big-endian value.
     fn s_bytes(&self) -> B256;
+    /// Returns the recovery identifier in legacy form (`27` or `28`), as expected by
+    /// Solidity's `ecrecover` and EIP-2612 `permit()`.
     fn v_legacy(&self) -> u8;
 }
 

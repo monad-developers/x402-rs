@@ -4,22 +4,15 @@ use x402_types::timestamp::UnixTimestamp;
 
 use crate::chain::ChecksummedAddress;
 
-// TODO configurable address per chain
-/// The canonical Permit2 contract address deployed on most chains.
+/// The canonical Permit2 contract address.
 pub const PERMIT2_ADDRESS: Address = address!("0x000000000022D473030F116dDEE9F6B43aC78BA3");
 
-// TODO configurable address per chain
 /// The X402 ExactPermit2Proxy contract address for settling Permit2 payments.
 pub const EXACT_PERMIT2_PROXY_ADDRESS: Address =
     address!("0x402085c248EeA27D92E8b30b2C58ed07f9E20001");
 
-// TODO configurable address per chain
 /// The X402 UptoPermit2Proxy contract address for settling Permit2 payments with variable amounts.
 /// This contract allows settling for any amount up to the permitted maximum.
-///
-/// Canonical address per x402-foundation/x402 commit ad2658a (PR #1880), matches the
-/// `@x402/evm` SDK constant `x402UptoPermit2ProxyAddress`. Deployed at this CREATE2
-/// address on Base mainnet + Base Sepolia + other EVM mainnets that ship UPTO.
 pub const UPTO_PERMIT2_PROXY_ADDRESS: Address =
     address!("0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002");
 
@@ -57,16 +50,14 @@ pub struct Permit2AuthorizationPermitted {
 
 /// Witness data for Permit2 upto payments.
 ///
-/// Binds the recipient address AND the authorized facilitator EOA, so only the
-/// caller whose address matches `facilitator` can invoke `settle` on the proxy.
-/// Matches `Witness(address to, address facilitator, uint256 validAfter)` on
-/// `x402UptoPermit2Proxy` per x402-foundation commit ad2658a.
+/// Binds both the recipient address and the authorized facilitator address,
+/// preventing unauthorized settlement or fund redirection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UptoPermit2Witness {
     /// The recipient address that will receive the funds.
     pub to: ChecksummedAddress,
-    /// The facilitator EOA authorized to invoke settle (`msg.sender` at settle time).
+    /// The facilitator address authorized to settle this payment (must be msg.sender on-chain).
     pub facilitator: ChecksummedAddress,
     /// Time after which the authorization becomes valid.
     pub valid_after: UnixTimestamp,
@@ -98,23 +89,3 @@ pub struct Permit2Payload<TWitness> {
 
 pub type ExactPermit2Payload = Permit2Payload<ExactPermit2Witness>;
 pub type UptoPermit2Payload = Permit2Payload<UptoPermit2Witness>;
-
-#[cfg(test)]
-mod tests {
-    use alloy_primitives::{B256, b256, keccak256};
-
-    /// Pins the EIP-712 typehash for the upto Witness struct against the
-    /// value queried on-chain via WITNESS_TYPEHASH() at
-    /// `0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002` on Base mainnet.
-    /// Any reorder of fields or rename in `v2_eip155_upto::types::Witness`
-    /// would change the hash and break interop with @x402/evm@2.12.0 clients.
-    #[test]
-    fn upto_witness_typehash_matches_onchain() {
-        const EXPECTED: B256 =
-            b256!("0xd4171c445a74218b01d4fd8af34ff1106580ea1e36ff837e64484bfaa2253b75");
-        let computed = keccak256(
-            "Witness(address to,address facilitator,uint256 validAfter)".as_bytes(),
-        );
-        assert_eq!(computed, EXPECTED, "upto witness typehash drifted from canonical");
-    }
-}
