@@ -156,6 +156,8 @@ The Permit2 implementation is designed to support gasless approval extensions:
     "eip1559": true,
     "flashblocks": false,
     "receipt_timeout_secs": 30,
+    "poll_interval_ms": 200,
+    "sync_send": false,
     "signers": [
       "$FACILITATOR_PRIVATE_KEY"
     ],
@@ -168,6 +170,12 @@ The Permit2 implementation is designed to support gasless approval extensions:
   }
 }
 ```
+
+Optional per-chain fields:
+
+- `receipt_timeout_secs` (default `30`) — how long to wait for a transaction receipt. On the `sync_send` path it bounds the synchronous call as a client-side timeout.
+- `poll_interval_ms` (default: alloy's `7000`) — receipt poll interval. Lower values improve receipt-detection latency on fast-finality chains (e.g. Monad). No effect when `sync_send` is `true`.
+- `sync_send` (default `false`) — submit via `eth_sendRawTransactionSync` (EIP-7966), which returns the receipt in a single RPC call instead of send + poll. Only enable on chains that implement EIP-7966 (e.g. Monad). When `true`, `poll_interval_ms` and a transaction's `confirmations` have no effect (the receipt is returned at inclusion).
 
 ## Dependencies
 
