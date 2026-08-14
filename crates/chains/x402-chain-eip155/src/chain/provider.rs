@@ -142,6 +142,70 @@ impl Eip155ChainProvider {
             self.signer_addresses[next]
         }
     }
+
+    /// Submit `txr` via `eth_sendRawTransactionSync` (EIP-7966): alloy fills and locally
+    /// signs the transaction, then sends the raw signed envelope and returns the receipt
+    /// in a single RPC round-trip — no separate send + poll.
+    ///
+    /// Bounded by `receipt_timeout_secs` as a client-side timeout: the HTTP transport has
+    /// no request timeout of its own, so without this bound a stalled RPC would hold the
+    /// settle handler open indefinitely (whereas the poll path frees it after its timeout).
+    /// On any failure the nonce is reset so the next attempt re-queries it — a transaction
+    /// that lands after a timeout is still counted by the pending-nonce requery.
+    async fn send_sync(
+        &self,
+        txr: TransactionRequest,
+        from_address: Address,
+    ) -> Result<TransactionReceipt, MetaTransactionSendError> {
+        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
+        match tokio::time::timeout(timeout, self.inner.send_transaction_sync(txr)).await {
+            Ok(Ok(receipt)) => Ok(receipt),
+            Ok(Err(e)) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::Transport(e))
+            }
+            Err(_elapsed) => {
+                // The node accepted the request but returned no receipt in time. The tx may
+                // still land, so this is surfaced distinctly from a submission failure.
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::Custom(format!(
+                    "sync_send receipt not returned within {}s",
+                    self.receipt_timeout_secs
+                )))
+            }
+        }
+    }
+
+    /// Standard path: submit the transaction, then poll for the receipt up to
+    /// `receipt_timeout_secs`, waiting for `confirmations` confirmations. On any failure
+    /// the nonce is reset so the next attempt re-queries it.
+    async fn send_and_poll(
+        &self,
+        txr: TransactionRequest,
+        confirmations: u64,
+        from_address: Address,
+    ) -> Result<TransactionReceipt, MetaTransactionSendError> {
+        let pending_tx = match self.inner.send_transaction(txr).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                return Err(MetaTransactionSendError::Transport(e));
+            }
+        };
+
+        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
+        let watcher = pending_tx
+            .with_required_confirmations(confirmations)
+            .with_timeout(Some(timeout));
+
+        match watcher.get_receipt().await {
+            Ok(receipt) => Ok(receipt),
+            Err(e) => {
+                self.nonce_manager.reset_nonce(from_address).await;
+                Err(MetaTransactionSendError::PendingTransaction(e))
+            }
+        }
+    }
 }
 
 /// Creates a new provider from configuration.
@@ -319,45 +383,9 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         }
 
         if self.sync_send {
-            // EIP-7966: `eth_sendRawTransactionSync` returns the receipt in a single
-            // RPC call, eliminating the send + poll round-trip. Only enable on chains
-            // that implement EIP-7966 (e.g. Monad).
-            match self.inner.send_transaction_sync(txr).await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    // Submission failed - reset nonce to force requery
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::Transport(e))
-                }
-            }
+            self.send_sync(txr, from_address).await
         } else {
-            // Standard path: send, then poll for the receipt with a timeout.
-            // Send transaction with error handling for nonce reset
-            let pending_tx = match self.inner.send_transaction(txr).await {
-                Ok(pending) => pending,
-                Err(e) => {
-                    // Transaction submission failed - reset nonce to force requery
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    return Err(MetaTransactionSendError::Transport(e));
-                }
-            };
-
-            // Get receipt with timeout and error handling for nonce reset
-            // Default timeout of 30 seconds is reasonable for most EVM chains
-            let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
-
-            let watcher = pending_tx
-                .with_required_confirmations(tx.confirmations)
-                .with_timeout(Some(timeout));
-
-            match watcher.get_receipt().await {
-                Ok(receipt) => Ok(receipt),
-                Err(e) => {
-                    // Receipt fetch failed (timeout or other error) - reset nonce to force requery
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    Err(MetaTransactionSendError::PendingTransaction(e))
-                }
-            }
+            self.send_and_poll(txr, tx.confirmations, from_address).await
         }
     }
 }
