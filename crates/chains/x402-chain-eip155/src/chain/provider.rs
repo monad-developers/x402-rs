@@ -522,3 +522,142 @@ pub async fn assert_contracts_exists<P: Provider>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod sync_send_tests {
+    //! Mock-`Asserter` coverage for the `sync_send` (EIP-7966) submission path.
+    //!
+    //! No live node. The request is fully pre-filled so the fillers issue no RPCs, and
+    //! the heartbeat block-poller stays paused (it only unpauses once a pending-tx
+    //! watcher is registered, which `send_transaction_sync` never does). So the only
+    //! outbound call is `eth_sendRawTransactionSync`, which consumes the single queued
+    //! receipt. The wallet filler signs locally — converting the request into an
+    //! envelope, which is what routes alloy to `send_raw_transaction_sync` (raw) rather
+    //! than node-side `eth_sendTransactionSync`.
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use alloy_network::{EthereumWallet, TransactionBuilder};
+    use alloy_primitives::{Address, Bytes, U256, address};
+    use alloy_provider::ProviderBuilder;
+    use alloy_provider::fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller};
+    use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
+    use alloy_signer::Signer;
+    use alloy_signer_local::PrivateKeySigner;
+    use alloy_transport::mock::Asserter;
+
+    use super::{Eip155ChainProvider, InnerProvider, MetaTransactionSendError};
+    use crate::chain::pending_nonce_manager::PendingNonceManager;
+    use crate::chain::types::Eip155ChainReference;
+
+    const CHAIN_ID: u64 = 10143; // Monad testnet
+    // Deterministic throwaway key (never used on-chain).
+    const TEST_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    // A known-good, deserializable successful receipt.
+    fn canned_receipt() -> TransactionReceipt {
+        serde_json::from_str(
+            r#"{
+                "transactionHash": "0xea1093d492a1dcb1bef708f771a99a96ff05dcab81ca76c31940300177fcf49f",
+                "blockHash": "0x8e38b4dbf6b11fcc3b9dee84fb7986e29ca0a02cecd8977c161ff7333329681e",
+                "blockNumber": "0xf4240",
+                "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "gasUsed": "0x723c",
+                "status": "0x1",
+                "contractAddress": null,
+                "cumulativeGasUsed": "0x723c",
+                "transactionIndex": "0x0",
+                "from": "0x39fa8c5f2793459d6622857e7d9fbb4bd91766d3",
+                "to": "0xc083e9947cf02b8ffc7d3090ae9aea72df98fd47",
+                "type": "0x0",
+                "effectiveGasPrice": "0x12bfb19e60",
+                "logs": []
+            }"#,
+        )
+        .expect("canned receipt should deserialize")
+    }
+
+    fn mocked_provider(
+        asserter: Asserter,
+        nonce_manager: PendingNonceManager,
+    ) -> Eip155ChainProvider {
+        let signer = TEST_KEY
+            .parse::<PrivateKeySigner>()
+            .expect("valid test key")
+            .with_chain_id(Some(CHAIN_ID));
+        let signer_addr = signer.address();
+        let wallet = EthereumWallet::from(signer);
+
+        // Mirror `from_config`'s filler stack (Gas -> BlobGas -> Nonce -> ChainId),
+        // but connect a mocked client instead of live transports.
+        let filler = JoinFill::new(
+            GasFiller::default(),
+            JoinFill::new(
+                BlobGasFiller::default(),
+                JoinFill::new(NonceFiller::new(nonce_manager.clone()), ChainIdFiller::default()),
+            ),
+        );
+        let inner: InnerProvider = ProviderBuilder::default()
+            .filler(filler)
+            .wallet(wallet)
+            .connect_mocked_client(asserter);
+
+        Eip155ChainProvider {
+            chain: Eip155ChainReference::new(CHAIN_ID),
+            eip1559: false,
+            flashblocks: false,
+            sync_send: true,
+            receipt_timeout_secs: 30,
+            inner,
+            signer_addresses: Arc::new(vec![signer_addr]),
+            signer_cursor: Arc::new(AtomicUsize::new(0)),
+            nonce_manager,
+        }
+    }
+
+    // Fully specified so no filler needs an RPC. Legacy (gas_price) keeps signing simple.
+    fn prefilled_tx(from: Address) -> TransactionRequest {
+        TransactionRequest::default()
+            .with_from(from)
+            .with_to(address!("00000000000000000000000000000000000000aa"))
+            .with_input(Bytes::from_static(&[0x00]))
+            .with_value(U256::ZERO)
+            .with_nonce(0)
+            .with_gas_limit(21_000)
+            .with_gas_price(20_000_000_000u128)
+            .with_chain_id(CHAIN_ID)
+    }
+
+    #[test]
+    fn sync_send_submits_raw_and_returns_receipt() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let asserter = Asserter::new();
+            let receipt = canned_receipt();
+            asserter.push_success(&receipt);
+
+            let provider = mocked_provider(asserter, PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+
+            let got = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .expect("sync_send should return the mocked receipt");
+            assert_eq!(got.transaction_hash, receipt.transaction_hash);
+        });
+    }
+
+    #[test]
+    fn sync_send_error_maps_to_transport() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let asserter = Asserter::new();
+            asserter.push_failure_msg("node rejected submission");
+
+            let provider = mocked_provider(asserter, PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+
+            let err = provider.send_sync(prefilled_tx(from), from).await.unwrap_err();
+            assert!(matches!(err, MetaTransactionSendError::Transport(_)));
+        });
+    }
+}
