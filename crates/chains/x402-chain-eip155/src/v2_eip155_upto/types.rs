@@ -159,6 +159,43 @@ pub mod facilitator_client_only {
             x402UptoPermit2Proxy.Witness witness;
         }
     );
+
+    #[cfg(test)]
+    mod tests {
+        use alloy_primitives::{B256, b256, keccak256};
+        use alloy_sol_types::SolStruct;
+
+        use super::x402UptoPermit2Proxy;
+
+        /// Pins the upto Permit2 `Witness` EIP-712 type to its canonical on-chain
+        /// definition.
+        ///
+        /// The first assertion ties the check to the `sol!`-generated
+        /// [`x402UptoPermit2Proxy::Witness`] (derived from
+        /// `abi/X402UptoPermit2Proxy.json`), so a field reorder or rename in the ABI
+        /// fails the test. A bare `keccak256` of a hardcoded string would instead stay
+        /// green while every signing hash silently changed and interop with `@x402/evm`
+        /// clients broke. The second assertion keeps the concrete typehash pinned; it
+        /// equals `WITNESS_TYPEHASH()` on `0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002`
+        /// (identical on Base and Monad mainnet).
+        #[test]
+        fn upto_witness_eip712_type_is_canonical() {
+            const CANONICAL: &str = "Witness(address to,address facilitator,uint256 validAfter)";
+            const EXPECTED_TYPEHASH: B256 =
+                b256!("0xd4171c445a74218b01d4fd8af34ff1106580ea1e36ff837e64484bfaa2253b75");
+
+            assert_eq!(
+                &*<x402UptoPermit2Proxy::Witness as SolStruct>::eip712_root_type(),
+                CANONICAL,
+                "upto witness EIP-712 type drifted from the canonical on-chain definition"
+            );
+            assert_eq!(
+                keccak256(CANONICAL.as_bytes()),
+                EXPECTED_TYPEHASH,
+                "upto witness typehash drifted from the canonical on-chain value"
+            );
+        }
+    }
 }
 
 #[cfg(any(feature = "facilitator", feature = "client"))]
