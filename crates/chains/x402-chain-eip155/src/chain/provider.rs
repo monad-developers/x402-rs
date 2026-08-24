@@ -1,17 +1,19 @@
+use alloy_network::eip2718::Encodable2718;
 use alloy_network::{Ethereum as AlloyEthereum, EthereumWallet, NetworkWallet, TransactionBuilder};
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, hex};
 use alloy_provider::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy_provider::{
-    Identity, PendingTransactionError, Provider, ProviderBuilder, RootProvider, WalletProvider,
+    Identity, PendingTransactionError, Provider, ProviderBuilder, RootProvider, SendableTx,
+    WalletProvider,
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::{BlockId, TransactionReceipt, TransactionRequest};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_transport::TransportError;
 use alloy_transport::layers::{FallbackLayer, ThrottleLayer};
+use alloy_transport::{TransportError, TransportResult};
 use alloy_transport_http::Http;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -42,6 +44,15 @@ static REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
         EXACT_PERMIT2_PROXY_ADDRESS,
     ]
 });
+
+/// Added to the node's receipt budget for the client-side timeout, so the node answers first
+/// and this wrapper only catches a transport that stopped responding.
+const SYNC_SEND_TRANSPORT_MARGIN_SECS: u64 = 5;
+
+/// `eth_sendRawTransactionSync` takes its receipt budget in milliseconds.
+fn node_receipt_timeout_ms(secs: u64) -> u64 {
+    secs.saturating_mul(1_000)
+}
 
 /// The fully composed Ethereum provider type used in this project.
 ///
@@ -157,8 +168,11 @@ impl Eip155ChainProvider {
         txr: TransactionRequest,
         from_address: Address,
     ) -> Result<TransactionReceipt, MetaTransactionSendError> {
-        let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
-        match tokio::time::timeout(timeout, self.inner.send_transaction_sync(txr)).await {
+        let timeout = std::time::Duration::from_secs(
+            self.receipt_timeout_secs
+                .saturating_add(SYNC_SEND_TRANSPORT_MARGIN_SECS),
+        );
+        match tokio::time::timeout(timeout, self.send_raw_sync(txr)).await {
             Ok(Ok(receipt)) => Ok(receipt),
             Ok(Err(e)) => {
                 self.nonce_manager.reset_nonce(from_address).await;
@@ -173,6 +187,26 @@ impl Eip155ChainProvider {
                     self.receipt_timeout_secs
                 )))
             }
+        }
+    }
+
+    /// EIP-7966 sync send, carrying the receipt timeout as the optional second parameter.
+    /// alloy's `send_raw_transaction_sync` omits it, so the node falls back to its own default
+    /// (2000ms on Monad) and returns an error while the transaction still lands.
+    async fn send_raw_sync(&self, txr: TransactionRequest) -> TransportResult<TransactionReceipt> {
+        match self.inner.fill(txr).await? {
+            SendableTx::Envelope(envelope) => {
+                let rlp = hex::encode_prefixed(envelope.encoded_2718());
+                self.inner
+                    .client()
+                    .request(
+                        "eth_sendRawTransactionSync",
+                        (rlp, node_receipt_timeout_ms(self.receipt_timeout_secs)),
+                    )
+                    .await
+            }
+            // No local signer, so the node signs and there is no envelope to encode.
+            SendableTx::Builder(tx) => self.inner.send_transaction_sync(tx).await,
         }
     }
 
@@ -687,5 +721,35 @@ mod sync_send_tests {
                 "sync_send did not route to eth_sendRawTransactionSync: {msg}"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod sync_send_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn hands_the_node_its_budget_in_milliseconds() {
+        assert_eq!(node_receipt_timeout_ms(2), 2_000);
+        assert_eq!(node_receipt_timeout_ms(30), 30_000);
+    }
+
+    #[test]
+    fn keeps_the_client_timeout_above_the_nodes() {
+        // Reversed, the wrapper fires first and reports a submission failure for a transaction
+        // the node was still about to confirm.
+        for secs in [1_u64, 2, 15, 30] {
+            let client_ms = secs.saturating_add(SYNC_SEND_TRANSPORT_MARGIN_SECS) * 1_000;
+            assert!(client_ms > node_receipt_timeout_ms(secs), "{secs}s");
+        }
+    }
+
+    #[test]
+    fn saturates_rather_than_wrapping_on_an_absurd_config() {
+        assert_eq!(node_receipt_timeout_ms(u64::MAX), u64::MAX);
+        assert_eq!(
+            u64::MAX.saturating_add(SYNC_SEND_TRANSPORT_MARGIN_SECS),
+            u64::MAX
+        );
     }
 }
