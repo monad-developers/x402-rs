@@ -1052,8 +1052,43 @@ pub enum Eip155ExactError {
     PaymentVerification(#[from] PaymentVerificationError),
 }
 
+/// ERC-3009 revert reasons that mean the payload cannot ever succeed, not that the facilitator
+/// is unhealthy. A client retrying a nonce it already spent is the common case, and it arrives
+/// as an `Error(string)` revert out of `eth_estimateGas`, so the reason string is the only
+/// signal available. Matched on the substring rather than the full message because the prefix
+/// is the token contract's own name and differs between deployments.
+const REPLAYED_AUTHORIZATION_REVERTS: [&str; 2] = [
+    // FiatTokenV2 (Circle USDC and the Monad deployments) for a used or cancelled nonce.
+    "authorization is used or canceled",
+    // Older FiatTokenV2 revisions and forks that kept the pre-cancellation wording.
+    "authorization is used",
+];
+
+/// True when the message carries a revert reason that a different payload would avoid.
+fn is_client_caused_revert(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    REPLAYED_AUTHORIZATION_REVERTS
+        .iter()
+        .any(|reason| message.contains(reason))
+}
+
 impl From<Eip155ExactError> for X402SchemeFacilitatorError {
     fn from(value: Eip155ExactError) -> Self {
+        // A spent authorization is the payer's problem and no retry against this facilitator
+        // will change it. Reporting it as an onchain failure returns 500, which makes every
+        // duplicate submission look like a facilitator fault to anything watching error rates.
+        if matches!(
+            value,
+            Eip155ExactError::Transport(_) | Eip155ExactError::ContractCall(_)
+        ) {
+            let message = value.to_string();
+            if is_client_caused_revert(&message) {
+                return Self::PaymentVerification(PaymentVerificationError::TransactionSimulation(
+                    message,
+                ));
+            }
+        }
+
         match value {
             Eip155ExactError::Transport(_) => Self::OnchainFailure(value.to_string()),
             Eip155ExactError::PendingTransaction(_) => Self::OnchainFailure(value.to_string()),
@@ -1112,5 +1147,74 @@ impl From<alloy_contract::Error> for Eip155ExactError {
             alloy_contract::Error::TransportError(e) => Self::Transport(e),
             alloy_contract::Error::PendingTransactionError(e) => Self::PendingTransaction(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    use super::*;
+    use alloy_transport::RpcError;
+    use x402_types::proto::{AsPaymentProblem, ErrorReason};
+
+    const REPLAY_REVERT: &str = "server returned an error response: error code 3: execution reverted: \
+         FiatTokenV2: authorization is used or canceled";
+
+    fn reason(error: Eip155ExactError) -> ErrorReason {
+        X402SchemeFacilitatorError::from(error)
+            .as_payment_problem()
+            .reason()
+    }
+
+    #[test]
+    fn a_replayed_authorization_is_a_client_error() {
+        assert_eq!(
+            reason(Eip155ExactError::ContractCall(REPLAY_REVERT.to_string())),
+            ErrorReason::TransactionSimulation
+        );
+    }
+
+    #[test]
+    fn a_replayed_authorization_over_the_transport_is_a_client_error() {
+        assert_eq!(
+            reason(Eip155ExactError::Transport(RpcError::local_usage_str(
+                REPLAY_REVERT
+            ))),
+            ErrorReason::TransactionSimulation
+        );
+    }
+
+    #[test]
+    fn matches_the_reason_whatever_the_token_contract_calls_itself() {
+        assert!(is_client_caused_revert(
+            "execution reverted: SomeOtherToken: AUTHORIZATION IS USED"
+        ));
+    }
+
+    #[test]
+    fn a_transport_failure_stays_an_onchain_failure() {
+        assert_eq!(
+            reason(Eip155ExactError::Transport(RpcError::local_usage_str(
+                "error sending request for url"
+            ))),
+            ErrorReason::UnexpectedError
+        );
+    }
+
+    #[test]
+    fn an_unrelated_revert_stays_an_onchain_failure() {
+        assert_eq!(
+            reason(Eip155ExactError::ContractCall(
+                "execution reverted: ERC20: transfer amount exceeds balance".to_string()
+            )),
+            ErrorReason::UnexpectedError
+        );
+    }
+
+    #[test]
+    fn a_reverted_receipt_stays_an_onchain_failure() {
+        assert_eq!(
+            reason(Eip155ExactError::TransactionReverted(TxHash::ZERO)),
+            ErrorReason::UnexpectedError
+        );
     }
 }
