@@ -203,7 +203,7 @@ fn settle_with_a_failed_gas_estimate_is_not_broadcast() {
     let asserter = Asserter::new();
     asserter.push_success(&"0x10");
     push_bytes(&asserter, (900u128, 400u128).abi_encode_params());
-    asserter.push_failure_msg("execution reverted");
+    rpc::push_revert(&asserter, &[]);
     let provider = Arc::new(MockProvider::new(asserter));
     let response = settle(provider.clone(), settle_body());
     assert_eq!(

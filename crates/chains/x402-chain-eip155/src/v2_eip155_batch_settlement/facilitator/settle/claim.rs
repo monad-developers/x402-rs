@@ -35,7 +35,7 @@ use crate::v2_eip155_batch_settlement::facilitator::submit::{
     ContractWrite, SettleContext, simulate_and_submit,
 };
 use crate::v2_eip155_batch_settlement::facilitator::voucher::{
-    ChannelVoucher, check_voucher_signature,
+    ChannelVoucher, check_batch_voucher_signature,
 };
 use crate::v2_eip155_batch_settlement::types::{ClaimPayload, VoucherClaim, VoucherFields};
 
@@ -104,13 +104,15 @@ async fn read_claim_totals<P: Provider>(
 
 /// Checks the payer voucher of every row that moves `totalClaimed`. These are
 /// the only rows the contract verifies. A payer with code gets no local
-/// verdict; the claim simulation from the broadcast sender decides.
+/// verdict; the claim simulation from the broadcast sender decides. It reads
+/// the code of each payer one time for the batch.
 async fn check_effective_vouchers<P: Provider>(
     provider: &P,
     claims: &[VoucherClaim],
     projection: &ClaimProjection,
     chain_id: u64,
 ) -> Result<(), &'static str> {
+    let mut payer_kinds = HashMap::new();
     for index in &projection.effective_rows {
         let claim = &claims[*index];
         let fields = VoucherFields {
@@ -123,7 +125,7 @@ async fn check_effective_vouchers<P: Provider>(
             voucher: &fields,
             chain_id,
         };
-        check_voucher_signature(provider, voucher).await?;
+        check_batch_voucher_signature(provider, voucher, &mut payer_kinds).await?;
     }
     Ok(())
 }

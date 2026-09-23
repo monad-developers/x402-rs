@@ -129,7 +129,7 @@ fn send_error_message(error: &MetaTransactionSendError) -> String {
     }
 }
 
-const UNCONFIRMED: &str = "transaction was broadcast, but no receipt was confirmed";
+const UNCONFIRMED: &str = "transaction submission result is unknown";
 const NOT_SENT: &str = "transaction submission failed";
 
 /// Decodes every `E` the canonical contract emitted in this receipt.

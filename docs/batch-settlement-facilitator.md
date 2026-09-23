@@ -133,11 +133,10 @@ Checks before broadcast, and the source of `amount` in the response:
   unclaimed escrow after bundled claims. `amount` comes from the `Refunded`
   event.
 
-A claim reads `channels(id)` for every distinct channel in one `eth_call`
-of the settlement contract's own `multicall`, at one pinned block. The number
-of channel-state reads does not change with the number of rows. Each row that
-raises `totalClaimed` with a zero `payerAuthorizer` adds one `eth_getCode`
-read of the payer.
+A claim reads each distinct channel through the contract's `multicall` at one pinned block.
+This uses one `eth_call` for all rows. Rows that raise `totalClaimed` with a zero `payerAuthorizer`
+also need one `eth_getCode` read per distinct payer. The facilitator keeps that result only for
+this request. It still checks each voucher from a payer without code with strict ECDSA.
 
 Claim rows can name different receivers and tokens if they share one
 `receiverAuthorizer`. A refund can bundle claims for other channels in one
@@ -273,9 +272,9 @@ with `isValid`. Only a request that fails to parse gets an error status. The
 `exact` and `upto` schemes use non-2xx statuses for failures; this scheme does
 not.
 
-`errorMessage` and `invalidMessage` hold an EVM revert reason and its data,
-or fixed text such as `RPC request failed`. They never hold transport error
-text, which can contain the RPC URL and its key. With the `telemetry`
+`errorMessage` and `invalidMessage` hold `execution reverted` and the revert
+data, or fixed text such as `RPC request failed`. They never hold node or
+transport error text, which can contain the RPC URL and its key. With the `telemetry`
 feature of this crate, some RPC failures also write a `warn` log line with
 the full error. A failed single-channel state read, payer token-balance read,
 or Permit2 allowance read writes no log line. Without `telemetry`, no batch
@@ -288,35 +287,36 @@ log line holds an RPC error.
 | Mined and reverted | `false` | `..._transaction_failed` | Transaction hash |
 | Claim or settle mined without its event | `true` | none | Transaction hash |
 | Deposit or refund mined without its event | `false` | Action error code | Transaction hash |
-| Broadcast, receipt not confirmed | `false` | `settlement_pending` | Transaction hash |
+| Submission result unknown | `false` | `settlement_pending` | Transaction hash |
 | Mined with the expected event | `true` | none | Transaction hash |
 
-For a deposit, the official SDK retries `settlement_pending` with the same
-request. The facilitator reads the recorded transaction receipt and returns
-its result. It does not broadcast again. A changed request that spends the same
+These rules apply to synchronous submission after local signing. With one RPC, send error codes
+`-32700`, `-32600`, `-32601`, `-32602`, `5`, and `6` return failure without a hash.
+Other errors stay pending, as do all such send errors with multiple RPCs. If no node accepted it,
+the hash has no receipt. Deposit retries can stay pending for five minutes.
+
+A pending hash does not prove that a node accepted the transaction. For a deposit, the official SDK
+retries `settlement_pending` with the same request. The facilitator reads the recorded transaction
+receipt and returns its result. It does not broadcast again. A changed request that spends the same
 authorization gets `deposit_payload` and cannot reuse that result.
 
-In one process, only one request for each deposit authorization can run the
-checks and broadcast at a time. An identical request that arrives during that
-time waits. It then reads the receipt of the first transaction. A changed
-request gets `deposit_payload` at once. A request for another authorization
-does not wait. If the first request ends before a broadcast, or its
-transaction reverts, the next identical request runs every check again.
+In one process, only one request for each deposit authorization can run the checks and broadcast at
+a time. An identical request that arrives during that time waits. It then reads the receipt of the
+first transaction. A changed request gets `deposit_payload` at once. A request for another
+authorization does not wait. If the first request ends before a broadcast, or its transaction
+reverts, the next identical request runs every check again.
 
-The facilitator records an unconfirmed broadcast or one that mined with success.
-An identical request in the next five minutes reads that transaction's receipt
-and returns its hash. The result can change as it confirms. The store holds at most
-10,000 records and requests in progress. When it is full, it removes the
-oldest record. If all 10,000 are requests in progress, a new deposit gets
-`deposit_transaction_failed` with no broadcast. A restart, another instance,
-expiry, or eviction loses that protection. A request with no record runs every
-deposit check again. Route retries to the same instance. If the settle request
-stops after the broadcast and before the send returns, the facilitator records
-nothing. The next identical request can then broadcast a second time, and one
-of the two transactions reverts. The deposit can land while the facilitator
-reports a failure. Read the channel state before you treat that deposit as failed.
-For other operations, inspect
-the returned transaction hash before a retry: the transaction can still land.
+The facilitator records an unconfirmed broadcast or one that mined with success. An identical
+request in the next five minutes reads that transaction's receipt and returns its hash. The result
+can change as it confirms. The store holds at most 10,000 records and requests in progress. When it
+is full, it removes the oldest record. If all 10,000 are requests in progress, a new deposit gets
+`deposit_transaction_failed` with no broadcast. A restart, another instance, expiry, or eviction
+loses that protection. A request with no record runs every deposit check again. Route retries to the
+same instance. If the settle request stops after the broadcast and before the send returns, the
+facilitator records nothing. The next identical request can then broadcast a second time, and one of
+the two transactions reverts. The deposit can land while the facilitator reports a failure. Read the
+channel state before you treat that deposit as failed. For other operations, inspect the returned
+transaction hash before a retry: the transaction can still land.
 
 The settle response `extra.channelState` holds the channel state at the end of
 the receipt's block. It includes later transactions in the same block. If that

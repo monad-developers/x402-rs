@@ -48,23 +48,46 @@ static REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
 /// and this wrapper only catches a transport that stopped responding.
 const SYNC_SEND_TRANSPORT_MARGIN_SECS: u64 = 5;
 
+/// JSON-RPC 2.0 codes for a request that did not run, and the EIP-7966 codes 5 and 6
+/// ("NOT added to mempool"). Other answers, such as "nonce too low" or "already known", can
+/// come after this transaction or an identical earlier send was admitted.
+const NOT_ADMITTED_CODES: [i64; 6] = [-32700, -32600, -32601, -32602, 5, 6];
+
 /// A `eth_sendRawTransactionSync` call that returned no receipt.
 enum SyncSendFailure {
+    /// The only configured RPC said that it did not add the transaction.
+    Rejected(TransportError),
     Rpc(TransportError),
     Elapsed(u64),
 }
 
 impl SyncSendFailure {
-    /// Once the signed transaction is sent, no error proves it was dropped: the node may
-    /// have admitted it before timing out or failing. A known hash therefore makes every
-    /// failure `Unconfirmed`, never a plain submission error.
+    /// With more than one RPC, the fallback can deliver the send to one node, fail at the
+    /// transport level, and then take the answer of the next node. So only a
+    /// [`NOT_ADMITTED_CODES`] answer from the only RPC proves a rejection.
+    fn from_rpc(error: TransportError, single_rpc: bool) -> Self {
+        let not_admitted = error
+            .as_error_resp()
+            .is_some_and(|payload| NOT_ADMITTED_CODES.contains(&payload.code));
+        if single_rpc && not_admitted {
+            SyncSendFailure::Rejected(error)
+        } else {
+            SyncSendFailure::Rpc(error)
+        }
+    }
+
+    /// Only [`SyncSendFailure::Rejected`] proves that the send was not admitted. Every other
+    /// failure with a known hash is `Unconfirmed`: the node may have admitted the transaction
+    /// before it timed out or failed.
     fn into_error(self, tx_hash: Option<B256>) -> MetaTransactionSendError {
         match (self, tx_hash) {
             (SyncSendFailure::Rpc(e), Some(tx_hash)) => MetaTransactionSendError::Unconfirmed {
                 tx_hash,
                 message: e.to_string(),
             },
-            (SyncSendFailure::Rpc(e), None) => MetaTransactionSendError::Transport(e),
+            (SyncSendFailure::Rejected(e), _) | (SyncSendFailure::Rpc(e), None) => {
+                MetaTransactionSendError::Transport(e)
+            }
             (SyncSendFailure::Elapsed(secs), tx_hash) => {
                 let message = format!("sync_send receipt not returned within {secs}s");
                 match tx_hash {
@@ -117,6 +140,8 @@ pub struct Eip155ChainProvider {
     /// Whether to submit transactions via `eth_sendRawTransactionSync` (EIP-7966).
     sync_send: bool,
     receipt_timeout_secs: u64,
+    /// True when the config has exactly one RPC, so no fallback node can take a send.
+    single_rpc: bool,
     inner: InnerProvider,
     /// Available signer addresses for round-robin selection.
     signer_addresses: Arc<Vec<Address>>,
@@ -220,7 +245,7 @@ impl Eip155ChainProvider {
 
         let failure = match tokio::time::timeout_at(deadline, self.send_raw_sync(sendable)).await {
             Ok(Ok(receipt)) => return Ok(receipt),
-            Ok(Err(e)) => SyncSendFailure::Rpc(e),
+            Ok(Err(e)) => SyncSendFailure::from_rpc(e, self.single_rpc),
             Err(_elapsed) => SyncSendFailure::Elapsed(self.receipt_timeout_secs),
         };
         self.nonce_manager.reset_nonce(from_address).await;
@@ -371,6 +396,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
             flashblocks: config.flashblocks(),
             sync_send: config.sync_send(),
             receipt_timeout_secs: config.receipt_timeout_secs(),
+            single_rpc: config.rpc().len() == 1,
             inner,
             signer_addresses,
             signer_cursor,
@@ -638,18 +664,22 @@ mod sync_send_tests {
     //! envelope, which is what routes alloy to `send_raw_transaction_sync` (raw) rather
     //! than node-side `eth_sendTransactionSync`.
 
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     use alloy_network::{EthereumWallet, TransactionBuilder};
-    use alloy_primitives::{Address, Bytes, U256, address};
+    use alloy_primitives::{Address, B256, Bytes, U256, address};
     use alloy_provider::ProviderBuilder;
     use alloy_provider::fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller};
     use alloy_rpc_client::RpcClient;
     use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
     use alloy_signer::Signer;
     use alloy_signer_local::PrivateKeySigner;
-    use alloy_transport::mock::Asserter;
+    use alloy_transport::layers::FallbackLayer;
+    use alloy_transport::mock::{Asserter, MockTransport};
+    use serde_json::{Value, json};
+    use tower::ServiceBuilder;
 
     use super::{Eip155ChainProvider, InnerProvider, MetaTransactionSendError};
     use crate::chain::pending_nonce_manager::PendingNonceManager;
@@ -720,6 +750,7 @@ mod sync_send_tests {
             flashblocks: false,
             sync_send: true,
             receipt_timeout_secs: 30,
+            single_rpc: true,
             inner,
             signer_addresses: Arc::new(vec![signer_addr]),
             signer_cursor: Arc::new(AtomicUsize::new(0)),
@@ -792,6 +823,97 @@ mod sync_send_tests {
                 .send_sync(prefilled_tx(from), from)
                 .await
                 .unwrap_err();
+            assert_eq!(err.broadcast_tx_hash(), Some(expected));
+        });
+    }
+
+    /// One sync send that the only RPC answers with `payload`, and the signed hash.
+    async fn send_answered_with(payload: &Value) -> (MetaTransactionSendError, B256) {
+        let asserter = Asserter::new();
+        asserter.push_failure(serde_json::from_value(payload.clone()).unwrap());
+        let provider = mocked_provider(asserter, PendingNonceManager::default());
+        let from = provider.signer_addresses[0];
+        let expected = signed_hash(&provider, from).await;
+        let err = provider
+            .send_sync(prefilled_tx(from), from)
+            .await
+            .unwrap_err();
+        (err, expected)
+    }
+
+    /// The only RPC says that it did not add the transaction, so no hash is reported.
+    #[test]
+    fn a_not_admitted_code_from_the_only_rpc_is_a_rejection() {
+        let answers = [
+            json!({ "code": -32700, "message": "Parse error" }),
+            json!({ "code": -32600, "message": "Invalid Request" }),
+            json!({ "code": 5, "message": "The transaction is not ready to be processed" }),
+            json!({ "code": 6, "message": "nonce gap", "data": "0x5" }),
+            json!({ "code": -32601, "message": "Method not found" }),
+            json!({ "code": -32602, "message": "Invalid params" }),
+        ];
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for payload in &answers {
+                let (err, _) = send_answered_with(payload).await;
+                let rejected = matches!(err, MetaTransactionSendError::Transport(_));
+                assert!(rejected, "{payload}: {err}");
+                assert_eq!(err.broadcast_tx_hash(), None, "{payload}");
+            }
+        });
+    }
+
+    /// Each answer can come after this transaction, or an identical earlier send, was
+    /// admitted. Monad also sends "overloaded" after its pool took the transaction.
+    #[test]
+    fn ambiguous_answers_keep_the_signed_hash() {
+        let answers = [
+            json!({ "code": -32000, "message": "Transaction nonce too low" }),
+            json!({ "code": -32000, "message": "already known" }),
+            json!({ "code": -32000, "message": "overloaded, try again later" }),
+            json!({ "code": -32000, "message": "Signer had insufficient balance" }),
+            json!({ "code": -32003, "message": "Transaction rejected" }),
+            json!({ "code": -32603, "message": "Internal error" }),
+            json!({ "code": 429, "message": "too many requests" }),
+        ];
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for payload in &answers {
+                let (err, expected) = send_answered_with(payload).await;
+                assert_eq!(err.broadcast_tx_hash(), Some(expected), "{payload}");
+            }
+        });
+    }
+
+    /// The first RPC fails at the transport level, possibly after its node took the send.
+    /// The fallback then sends the same bytes to the second RPC. Its "not added" answer
+    /// does not prove that the first node dropped the transaction.
+    #[test]
+    fn a_not_admitted_code_after_a_fallback_keeps_the_signed_hash() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (failed, answered) = (Asserter::new(), Asserter::new());
+            let payload = json!({ "code": 5, "message": "not ready" });
+            answered.push_failure(serde_json::from_value(payload).unwrap());
+            let transports = vec![
+                MockTransport::new(failed),
+                MockTransport::new(answered.clone()),
+            ];
+            let count = NonZeroUsize::new(transports.len()).unwrap();
+            let fallback = ServiceBuilder::new()
+                .layer(FallbackLayer::default().with_active_transport_count(count))
+                .service(transports);
+            let client = RpcClient::new(fallback, false);
+            let mut provider = provider_over(client, PendingNonceManager::default());
+            provider.single_rpc = false;
+            let from = provider.signer_addresses[0];
+            let expected = signed_hash(&provider, from).await;
+
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            assert!(
+                answered.pop_response().is_none(),
+                "the second RPC must answer"
+            );
             assert_eq!(err.broadcast_tx_hash(), Some(expected));
         });
     }

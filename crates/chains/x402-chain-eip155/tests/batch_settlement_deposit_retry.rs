@@ -196,7 +196,7 @@ fn mined_revert_stays_a_failure_with_its_hash() {
     assert!(response.get("extra").is_none());
 
     push_deposit_reads(&retry.asserter, 5_000);
-    retry.asserter.push_failure_msg("execution reverted");
+    rpc::push_revert(&retry.asserter, &[]);
     let next = retry.settle(&retry.body());
     assert_eq!(next["errorReason"], SIMULATION_FAILED);
     assert_eq!(retry.receipt_reads(), 1);
@@ -387,7 +387,7 @@ fn unsent_deposit_leaves_no_pending_state() {
     assert_eq!(first["transaction"], "");
 
     push_deposit_reads(&asserter, 5_000);
-    asserter.push_failure_msg("execution reverted");
+    rpc::push_revert(&asserter, &[]);
     let second = run(facilitator.settle(&settle_request(&body))).unwrap().0;
     assert_eq!(second["errorReason"], SIMULATION_FAILED, "{second}");
     assert!(

@@ -80,7 +80,7 @@ fn consumed_authorization_fails_simulation_without_broadcast() {
     let payer = PrivateKeySigner::random();
     let asserter = Asserter::new();
     push_deposit_reads(&asserter, 5_000);
-    asserter.push_failure_msg("execution reverted: FiatTokenV2: authorization is used or canceled");
+    rpc::push_revert(&asserter, &[]);
     let provider = Arc::new(MockProvider::new(asserter));
     let response = settle(facilitator(provider.clone()).as_ref(), &body(&payer));
     assert_eq!(

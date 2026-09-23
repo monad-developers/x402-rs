@@ -159,7 +159,7 @@ fn failed_mixed_claim_batch_is_one_warning_that_names_no_row() {
         let asserter = Asserter::new();
         no_code(&asserter);
         push_claim_totals(&asserter, "0x10", &[(1_000, 0); 3]);
-        no_code(&asserter);
+        // Rows 1 and 3 name one payer, so the facilitator reads its code one time.
         no_code(&asserter);
         push_revert(&asserter, &REVERT_DATA);
         Arc::new(MockProvider::new(asserter))

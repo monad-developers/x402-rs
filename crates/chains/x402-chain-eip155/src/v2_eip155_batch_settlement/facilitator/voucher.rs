@@ -20,6 +20,8 @@
 //! only, the facilitator calls the wallet directly (see
 //! [`check_contract_voucher`]).
 
+use std::collections::HashMap;
+
 use alloy_primitives::{Address, Bytes, U128};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockId, TransactionRequest};
@@ -80,6 +82,32 @@ pub async fn check_voucher_signature<P: Provider>(
         verify_ecdsa(&signed, EcdsaRules::Strict).map(|()| SignerCheck::Ecdsa)
     };
     result.map_err(signature_reason)
+}
+
+/// [`check_voucher_signature`] with one code read for each payer. A claim
+/// batch can name one payer in many rows. `payer_kinds` keeps only the code
+/// result of a payer with a zero `payerAuthorizer`, never a signature verdict.
+/// So each voucher of a payer without code gets its own strict ECDSA check.
+pub async fn check_batch_voucher_signature<P: Provider>(
+    provider: &P,
+    voucher: ChannelVoucher<'_>,
+    payer_kinds: &mut HashMap<Address, SignerCheck>,
+) -> Result<SignerCheck, &'static str> {
+    if Address::from(voucher.config.payer_authorizer) != Address::ZERO {
+        return check_voucher_signature(provider, voucher).await;
+    }
+    let payer: Address = voucher.config.payer.into();
+    match payer_kinds.get(&payer).copied() {
+        Some(SignerCheck::Contract) => Ok(SignerCheck::Contract),
+        Some(SignerCheck::Ecdsa) => verify_ecdsa(&voucher.signed(payer), EcdsaRules::Strict)
+            .map(|()| SignerCheck::Ecdsa)
+            .map_err(signature_reason),
+        None => {
+            let kind = check_voucher_signature(provider, voucher).await?;
+            payer_kinds.insert(payer, kind);
+            Ok(kind)
+        }
+    }
 }
 
 /// Decides a payer-with-code voucher against channel state read at `block`.
