@@ -62,12 +62,15 @@ Enable the scheme per chain in `config.json`. The scheme takes no options.
 ```json
 {
   "id": "v2-eip155-batch-settlement",
-  "chains": "eip155:143"
+  "chains": "eip155:{143,10143}"
 }
 ```
 
-- Enable only chains where the canonical contracts have code. Monad mainnet
-  (`eip155:143`) is verified. Monad testnet has no deployment; keep it off.
+- Enable only chains where the canonical contracts have code. The three
+  contracts are deployed and source-verified at the same addresses on Monad
+  mainnet (`eip155:143`) and Monad testnet (`eip155:10143`).
+- `chains` is one pattern string, not an array. Use `eip155:{143,10143}` for
+  a set of chains.
 - Any key in `config` makes the builder fail. The registry then logs the
   error and registers no handler, so `/supported` omits the scheme.
 - The scheme uses the canonical addresses only. There is no override.
@@ -396,5 +399,4 @@ The facilitator keeps no channel state. The server must:
   the simulation.
 - A request whose `scheme` is not `batch-settlement` fails to parse and gets
   a verification error, not a scheme error code.
-- The sample configuration enables Monad mainnet only. Testnet support waits
-  for verified testnet deployments.
+- The sample configuration enables Monad mainnet and Monad testnet only.
