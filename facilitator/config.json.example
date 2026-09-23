@@ -3,7 +3,7 @@
   "host": "0.0.0.0",
   "chains": {
     "eip155:84532": {
-      "_comment": "Base Sepolia"
+      "_comment": "Base Sepolia",
       "eip1559": true,
       "flashblocks": true,
       "signers": [
@@ -57,7 +57,7 @@
       ]
     },
     "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": {
-      "_comment": "Solana Mainnet"
+      "_comment": "Solana Mainnet",
       "signer": "SOLANA_PRIVATE_KEY",
       "rpc": "https://rpc.com/solana/5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
       "pubsub": "wss://rpc.com/solana/5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
