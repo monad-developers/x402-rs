@@ -1109,7 +1109,10 @@ impl From<MetaTransactionSendError> for Eip155ExactError {
     fn from(e: MetaTransactionSendError) -> Self {
         match e {
             MetaTransactionSendError::Transport(e) => Self::Transport(e),
-            MetaTransactionSendError::PendingTransaction(e) => Self::PendingTransaction(e),
+            // exact and upto have no field for the pending hash; keep it in the message.
+            MetaTransactionSendError::Unconfirmed { tx_hash, message } => {
+                Self::ContractCall(format!("{message} (broadcast transaction {tx_hash})"))
+            }
             MetaTransactionSendError::Custom(e) => Self::ContractCall(e),
         }
     }
@@ -1205,6 +1208,27 @@ mod error_classification_tests {
         assert_eq!(
             reason(Eip155ExactError::ContractCall(
                 "execution reverted: ERC20: transfer amount exceeds balance".to_string()
+            )),
+            ErrorReason::UnexpectedError
+        );
+    }
+
+    /// An unconfirmed broadcast has the class of a transport failure.
+    #[test]
+    fn an_unconfirmed_broadcast_keeps_its_classification() {
+        let unconfirmed = |message: &str| {
+            Eip155ExactError::from(MetaTransactionSendError::Unconfirmed {
+                tx_hash: TxHash::ZERO,
+                message: message.to_string(),
+            })
+        };
+        assert_eq!(
+            reason(unconfirmed(REPLAY_REVERT)),
+            ErrorReason::TransactionSimulation
+        );
+        assert_eq!(
+            reason(unconfirmed(
+                "transaction was not confirmed within the timeout"
             )),
             ErrorReason::UnexpectedError
         );

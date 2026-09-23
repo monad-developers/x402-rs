@@ -112,6 +112,10 @@ Create a `config.json` file:
 }
 ```
 
+The EVM `batch-settlement` scheme (`v2-eip155-batch-settlement`) takes no
+options and needs the canonical contracts on each enabled chain. See the
+[batch settlement facilitator guide](../docs/batch-settlement-facilitator.md).
+
 ### Environment Variables
 
 | Variable                      | Description                      | Default       |

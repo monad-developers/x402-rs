@@ -31,6 +31,9 @@ The crate is organized into several modules:
 - **`chain`** - Core EVM chain types, providers, and configuration
 - **`v1_eip155_exact`** - V1 protocol implementation with network names
 - **`v2_eip155_exact`** - V2 protocol implementation with CAIP-2 chain IDs
+- **`v2_eip155_batch_settlement`** - V2 `batch-settlement` scheme: channel deposits, cumulative
+  vouchers, server-signed batch claims and refunds (facilitator side only; see the
+  [facilitator guide](../../../docs/batch-settlement-facilitator.md))
 
 ## Feature Flags
 

@@ -3,7 +3,7 @@
   "host": "0.0.0.0",
   "chains": {
     "eip155:84532": {
-      "_comment": "Base Sepolia"
+      "_comment": "Base Sepolia",
       "eip1559": true,
       "flashblocks": true,
       "signers": [
@@ -16,8 +16,48 @@
         }
       ]
     },
+    "eip155:143": {
+      "_comment": "Monad mainnet. flashblocks: true estimates gas at latest, not pending",
+      "eip1559": true,
+      "flashblocks": true,
+      "sync_send": true,
+      "receipt_timeout_secs": 10,
+      "signers": [
+          "0xWALLET"
+      ],
+      "rpc": [
+        {
+          "http": "https://rpc.com/eip155/143",
+          "rate_limit": 1200
+        },
+        {
+          "http": "https://rpc.monad.xyz",
+          "rate_limit": 25
+        }
+      ]
+    },
+    "eip155:10143": {
+      "_comment": "Monad testnet. flashblocks: true estimates gas at latest, not pending",
+      "eip1559": true,
+      "flashblocks": true,
+      "sync_send": true,
+      "receipt_timeout_secs": 10,
+      "signers": [
+          "0xWALLET"
+      ],
+      "rpc": [
+        {
+          "http": "https://rpc.com/eip155/10143",
+          "rate_limit": 1200
+        },
+        {
+          "http": "https://testnet-rpc.monad.xyz",
+          "rate_limit": 25
+        }
+      ]
+    },
     "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": {
-      "_comment": "Solana Mainnet"
+      "_comment": "Solana Mainnet",
       "signer": "SOLANA_PRIVATE_KEY",
       "rpc": "https://rpc.com/solana/5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
       "pubsub": "wss://rpc.com/solana/5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
@@ -35,6 +75,11 @@
     {
       "id": "v2-eip155-upto",
       "chains": "eip155:*"
+    },
+    {
+      "_comment": "Monad mainnet and testnet: the canonical batch contracts have code on both",
+      "id": "v2-eip155-batch-settlement",
+      "chains": "eip155:{143,10143}"
     },
     {
       "_comment": "Solana schemes allow Phantom Lighthouse program by default",
