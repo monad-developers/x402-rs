@@ -5,8 +5,7 @@ use alloy_provider::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy_provider::{
-    Identity, PendingTransactionError, Provider, ProviderBuilder, RootProvider, SendableTx,
-    WalletProvider,
+    Identity, Provider, ProviderBuilder, RootProvider, SendableTx, WalletProvider,
 };
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::{BlockId, TransactionReceipt, TransactionRequest};
@@ -48,6 +47,34 @@ static REQUIRED_CONTRACT_ADDRESSES: LazyLock<Vec<Address>> = LazyLock::new(|| {
 /// Added to the node's receipt budget for the client-side timeout, so the node answers first
 /// and this wrapper only catches a transport that stopped responding.
 const SYNC_SEND_TRANSPORT_MARGIN_SECS: u64 = 5;
+
+/// A `eth_sendRawTransactionSync` call that returned no receipt.
+enum SyncSendFailure {
+    Rpc(TransportError),
+    Elapsed(u64),
+}
+
+impl SyncSendFailure {
+    /// Once the signed transaction is sent, no error proves it was dropped: the node may
+    /// have admitted it before timing out or failing. A known hash therefore makes every
+    /// failure `Unconfirmed`, never a plain submission error.
+    fn into_error(self, tx_hash: Option<B256>) -> MetaTransactionSendError {
+        match (self, tx_hash) {
+            (SyncSendFailure::Rpc(e), Some(tx_hash)) => MetaTransactionSendError::Unconfirmed {
+                tx_hash,
+                message: e.to_string(),
+            },
+            (SyncSendFailure::Rpc(e), None) => MetaTransactionSendError::Transport(e),
+            (SyncSendFailure::Elapsed(secs), tx_hash) => {
+                let message = format!("sync_send receipt not returned within {secs}s");
+                match tx_hash {
+                    Some(tx_hash) => MetaTransactionSendError::Unconfirmed { tx_hash, message },
+                    None => MetaTransactionSendError::Custom(message),
+                }
+            }
+        }
+    }
+}
 
 /// `eth_sendRawTransactionSync` takes its receipt budget in milliseconds.
 fn node_receipt_timeout_ms(secs: u64) -> u64 {
@@ -172,29 +199,42 @@ impl Eip155ChainProvider {
             self.receipt_timeout_secs
                 .saturating_add(SYNC_SEND_TRANSPORT_MARGIN_SECS),
         );
-        match tokio::time::timeout(timeout, self.send_raw_sync(txr)).await {
-            Ok(Ok(receipt)) => Ok(receipt),
+        // One deadline covers the fill and the send. Signing before the send lets
+        // every failure after it name the hash.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let sendable = match tokio::time::timeout_at(deadline, self.inner.fill(txr)).await {
+            Ok(Ok(sendable)) => sendable,
             Ok(Err(e)) => {
                 self.nonce_manager.reset_nonce(from_address).await;
-                Err(MetaTransactionSendError::Transport(e))
+                return Err(MetaTransactionSendError::Transport(e));
             }
             Err(_elapsed) => {
-                // The node accepted the request but returned no receipt in time. The tx may
-                // still land, so this is surfaced distinctly from a submission failure.
                 self.nonce_manager.reset_nonce(from_address).await;
-                Err(MetaTransactionSendError::Custom(format!(
-                    "sync_send receipt not returned within {}s",
-                    self.receipt_timeout_secs
-                )))
+                return Err(SyncSendFailure::Elapsed(self.receipt_timeout_secs).into_error(None));
             }
-        }
+        };
+        let tx_hash = match &sendable {
+            SendableTx::Envelope(envelope) => Some(envelope.trie_hash()),
+            SendableTx::Builder(_) => None,
+        };
+
+        let failure = match tokio::time::timeout_at(deadline, self.send_raw_sync(sendable)).await {
+            Ok(Ok(receipt)) => return Ok(receipt),
+            Ok(Err(e)) => SyncSendFailure::Rpc(e),
+            Err(_elapsed) => SyncSendFailure::Elapsed(self.receipt_timeout_secs),
+        };
+        self.nonce_manager.reset_nonce(from_address).await;
+        Err(failure.into_error(tx_hash))
     }
 
     /// EIP-7966 sync send, carrying the receipt timeout as the optional second parameter.
     /// alloy's `send_raw_transaction_sync` omits it, so the node falls back to its own default
     /// (2000ms on Monad) and returns an error while the transaction still lands.
-    async fn send_raw_sync(&self, txr: TransactionRequest) -> TransportResult<TransactionReceipt> {
-        match self.inner.fill(txr).await? {
+    async fn send_raw_sync(
+        &self,
+        sendable: SendableTx<AlloyEthereum>,
+    ) -> TransportResult<TransactionReceipt> {
+        match sendable {
             SendableTx::Envelope(envelope) => {
                 let rlp = hex::encode_prefixed(envelope.encoded_2718());
                 self.inner
@@ -227,6 +267,8 @@ impl Eip155ChainProvider {
             }
         };
 
+        // The transaction is already broadcast; a receipt failure keeps its hash.
+        let tx_hash = *pending_tx.tx_hash();
         let timeout = std::time::Duration::from_secs(self.receipt_timeout_secs);
         let watcher = pending_tx
             .with_required_confirmations(confirmations)
@@ -236,7 +278,10 @@ impl Eip155ChainProvider {
             Ok(receipt) => Ok(receipt),
             Err(e) => {
                 self.nonce_manager.reset_nonce(from_address).await;
-                Err(MetaTransactionSendError::PendingTransaction(e))
+                Err(MetaTransactionSendError::Unconfirmed {
+                    tx_hash,
+                    message: e.to_string(),
+                })
             }
         }
     }
@@ -392,6 +437,9 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
             .with_to(tx.to)
             .with_from(from_address)
             .with_input(tx.calldata);
+        if let Some(gas_limit) = tx.gas_limit {
+            txr.set_gas_limit(gas_limit);
+        }
 
         if !self.eip1559 {
             let provider = &self.inner;
@@ -429,11 +477,23 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
 pub enum MetaTransactionSendError {
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error(transparent)]
-    PendingTransaction(#[from] PendingTransactionError),
+    /// Broadcast, but no receipt arrived. The transaction may still be mined, so
+    /// callers must reconcile against `tx_hash` instead of re-submitting.
+    #[error("{message} (broadcast transaction {tx_hash})")]
+    Unconfirmed { tx_hash: B256, message: String },
     #[allow(dead_code)] // Public for consumption by downstream crates.
     #[error("{0}")]
     Custom(String),
+}
+
+impl MetaTransactionSendError {
+    /// The hash of a transaction that reached the network, when one exists.
+    pub fn broadcast_tx_hash(&self) -> Option<B256> {
+        match self {
+            MetaTransactionSendError::Unconfirmed { tx_hash, .. } => Some(*tx_hash),
+            _ => None,
+        }
+    }
 }
 
 impl ChainProviderOps for Eip155ChainProvider {
@@ -486,6 +546,8 @@ pub struct MetaTransaction {
     pub confirmations: u64,
     /// Optional sender address.
     pub from: Option<Address>,
+    /// Optional gas limit the caller already estimated. When unset, the provider estimates gas.
+    pub gas_limit: Option<u64>,
 }
 
 impl MetaTransaction {
@@ -495,11 +557,17 @@ impl MetaTransaction {
             calldata,
             confirmations: 1,
             from: None,
+            gas_limit: None,
         }
     }
 
     pub fn with_from(mut self, from: Address) -> Self {
         self.from = Some(from);
+        self
+    }
+
+    pub fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = Some(gas_limit);
         self
     }
 }
@@ -577,6 +645,7 @@ mod sync_send_tests {
     use alloy_primitives::{Address, Bytes, U256, address};
     use alloy_provider::ProviderBuilder;
     use alloy_provider::fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller};
+    use alloy_rpc_client::RpcClient;
     use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
     use alloy_signer::Signer;
     use alloy_signer_local::PrivateKeySigner;
@@ -617,6 +686,10 @@ mod sync_send_tests {
         asserter: Asserter,
         nonce_manager: PendingNonceManager,
     ) -> Eip155ChainProvider {
+        provider_over(RpcClient::mocked(asserter), nonce_manager)
+    }
+
+    fn provider_over(client: RpcClient, nonce_manager: PendingNonceManager) -> Eip155ChainProvider {
         let signer = TEST_KEY
             .parse::<PrivateKeySigner>()
             .expect("valid test key")
@@ -639,7 +712,7 @@ mod sync_send_tests {
         let inner: InnerProvider = ProviderBuilder::default()
             .filler(filler)
             .wallet(wallet)
-            .connect_mocked_client(asserter);
+            .connect_client(client);
 
         Eip155ChainProvider {
             chain: Eip155ChainReference::new(CHAIN_ID),
@@ -686,20 +759,113 @@ mod sync_send_tests {
     }
 
     #[test]
-    fn sync_send_error_maps_to_transport() {
+    fn sync_send_error_keeps_the_signed_hash() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let asserter = Asserter::new();
             asserter.push_failure_msg("node rejected submission");
 
             let provider = mocked_provider(asserter, PendingNonceManager::default());
             let from = provider.signer_addresses[0];
+            let expected = signed_hash(&provider, from).await;
 
             let err = provider
                 .send_sync(prefilled_tx(from), from)
                 .await
                 .unwrap_err();
-            assert!(matches!(err, MetaTransactionSendError::Transport(_)));
+            assert_eq!(err.broadcast_tx_hash(), Some(expected));
+            assert!(err.to_string().contains("node rejected submission"));
         });
+    }
+
+    /// EIP-7966 code 4: the node admitted the transaction but gave up waiting for it.
+    #[test]
+    fn sync_send_node_timeout_is_unconfirmed() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let asserter = Asserter::new();
+            let payload = serde_json::json!({ "code": 4, "message": "not processed within 2s" });
+            asserter.push_failure(serde_json::from_value(payload).unwrap());
+            let provider = mocked_provider(asserter, PendingNonceManager::default());
+            let from = provider.signer_addresses[0];
+            let expected = signed_hash(&provider, from).await;
+
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            assert_eq!(err.broadcast_tx_hash(), Some(expected));
+        });
+    }
+
+    /// The local timeout fires when the transport stops answering after the send.
+    #[test]
+    fn local_timeout_with_a_signed_hash_is_unconfirmed() {
+        let tx_hash = alloy_primitives::B256::repeat_byte(7);
+        let err = super::SyncSendFailure::Elapsed(30).into_error(Some(tx_hash));
+        assert_eq!(err.broadcast_tx_hash(), Some(tx_hash));
+        assert!(err.to_string().contains("30s"));
+    }
+
+    /// Without a local signature there is no hash to report, so nothing claims a
+    /// broadcast the provider cannot name.
+    #[test]
+    fn failures_without_a_signed_hash_keep_their_old_variants() {
+        let elapsed = super::SyncSendFailure::Elapsed(30).into_error(None);
+        assert!(matches!(elapsed, MetaTransactionSendError::Custom(_)));
+        let rpc = alloy_transport::TransportErrorKind::custom_str("down");
+        let rpc = super::SyncSendFailure::Rpc(rpc).into_error(None);
+        assert!(matches!(rpc, MetaTransactionSendError::Transport(_)));
+    }
+
+    /// An HTTP RPC that accepts connections and never answers. Timeout 0 gives
+    /// the shortest deadline: the 5 s transport margin.
+    fn stalled_provider() -> Eip155ChainProvider {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().collect();
+        });
+        let client = RpcClient::new_http(url.parse().unwrap());
+        let mut provider = provider_over(client, PendingNonceManager::default());
+        provider.receipt_timeout_secs = 0;
+        provider
+    }
+
+    /// The gas estimate inside `fill` stalls. The deadline still fires, and no
+    /// hash exists because nothing was signed.
+    #[test]
+    fn a_stalled_fill_stops_at_the_deadline_without_a_hash() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = stalled_provider();
+            let from = provider.signer_addresses[0];
+            let mut txr = prefilled_tx(from);
+            txr.gas = None;
+            let err = provider.send_sync(txr, from).await.unwrap_err();
+            assert!(matches!(err, MetaTransactionSendError::Custom(_)), "{err}");
+            assert_eq!(err.broadcast_tx_hash(), None);
+        });
+    }
+
+    /// The signed send stalls. The deadline fires, and the hash stays known.
+    #[test]
+    fn a_stalled_send_stops_at_the_deadline_with_its_hash() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = stalled_provider();
+            let from = provider.signer_addresses[0];
+            let expected = signed_hash(&provider, from).await;
+            let err = provider
+                .send_sync(prefilled_tx(from), from)
+                .await
+                .unwrap_err();
+            assert_eq!(err.broadcast_tx_hash(), Some(expected));
+        });
+    }
+
+    async fn signed_hash(provider: &Eip155ChainProvider, from: Address) -> alloy_primitives::B256 {
+        use alloy_network::eip2718::Encodable2718;
+        match provider.inner.fill(prefilled_tx(from)).await.unwrap() {
+            alloy_provider::SendableTx::Envelope(envelope) => envelope.trie_hash(),
+            alloy_provider::SendableTx::Builder(_) => panic!("wallet must sign locally"),
+        }
     }
 
     /// The Asserter cannot inspect outgoing calls, but its empty-queue error names the

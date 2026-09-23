@@ -114,6 +114,9 @@ For custom facilitator implementations, see the [Build Your Own Facilitator](./d
 
 For full facilitator configuration and deployment details, see the [`x402-facilitator` README](./facilitator/README.md).
 
+To operate the EVM `batch-settlement` scheme, see the
+[batch settlement facilitator guide](./docs/batch-settlement-facilitator.md).
+
 ## Roadmap
 
 | Milestone                           | Description                                                                                              |   Status   |

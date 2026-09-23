@@ -35,7 +35,9 @@ facilitator = [
   "tower",
   "async-trait",
   "url",
-  "rand"
+  "rand",
+  # Batch-settlement outcome events do not require the telemetry feature.
+  "tracing"
 ]
 full = ["telemetry", "client", "server", "facilitator"]
 

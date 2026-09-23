@@ -16,6 +16,26 @@
         }
       ]
     },
+    "eip155:143": {
+      "_comment": "Monad mainnet. flashblocks: true estimates gas at latest, not pending",
+      "eip1559": true,
+      "flashblocks": true,
+      "sync_send": true,
+      "receipt_timeout_secs": 10,
+      "signers": [
+          "0xWALLET"
+      ],
+      "rpc": [
+        {
+          "http": "https://rpc.com/eip155/143",
+          "rate_limit": 1200
+        },
+        {
+          "http": "https://rpc.monad.xyz",
+          "rate_limit": 25
+        }
+      ]
+    },
     "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": {
       "_comment": "Solana Mainnet"
       "signer": "SOLANA_PRIVATE_KEY",
@@ -35,6 +55,11 @@
     {
       "id": "v2-eip155-upto",
       "chains": "eip155:*"
+    },
+    {
+      "_comment": "Monad mainnet only: the batch contracts have no code on Monad testnet yet",
+      "id": "v2-eip155-batch-settlement",
+      "chains": "eip155:143"
     },
     {
       "_comment": "Solana schemes allow Phantom Lighthouse program by default",
